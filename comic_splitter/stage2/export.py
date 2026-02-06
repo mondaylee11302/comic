@@ -107,6 +107,126 @@ def _select_primary_regions(
     return _sorted_regions(kept_all)
 
 
+def _union_bbox(a: List[int], b: List[int]) -> List[int]:
+    ax1, ay1, ax2, ay2 = [int(v) for v in a]
+    bx1, by1, bx2, by2 = [int(v) for v in b]
+    return [min(ax1, bx1), min(ay1, by1), max(ax2, bx2), max(ay2, by2)]
+
+
+def _x_overlap_ratio(a: List[int], b: List[int]) -> float:
+    ax1, _, ax2, _ = [int(v) for v in a]
+    bx1, _, bx2, _ = [int(v) for v in b]
+    inter = float(max(0, min(ax2, bx2) - max(ax1, bx1)))
+    base = float(max(1, min(ax2 - ax1, bx2 - bx1)))
+    return inter / base
+
+
+def _y_gap(a: List[int], b: List[int]) -> int:
+    _, ay1, _, ay2 = [int(v) for v in a]
+    _, by1, _, by2 = [int(v) for v in b]
+    if ay2 < by1:
+        return by1 - ay2
+    if by2 < ay1:
+        return ay1 - by2
+    return 0
+
+
+def _merge_fragmented_regions(
+    regions: List[Dict],
+    merge_iou_thr: float,
+    merge_x_overlap_thr: float,
+    merge_gap_px: int,
+    merge_containment_thr: float,
+    merge_fragment_max_area_ratio: float,
+) -> List[Dict]:
+    grouped: Dict[int, List[Dict]] = {}
+    for r in regions:
+        grouped.setdefault(int(r.get("band_index", -1)), []).append(dict(r))
+
+    merged_all: List[Dict] = []
+    for _, group in grouped.items():
+        changed = True
+        while changed and len(group) > 1:
+            changed = False
+            i = 0
+            while i < len(group):
+                j = i + 1
+                while j < len(group):
+                    a = group[i]
+                    b = group[j]
+                    ab = a.get("bbox", [0, 0, 0, 0])
+                    bb = b.get("bbox", [0, 0, 0, 0])
+
+                    iou = _iou(ab, bb)
+                    contain = max(_containment(ab, bb), _containment(bb, ab))
+                    x_ov = _x_overlap_ratio(ab, bb)
+                    yg = _y_gap(ab, bb)
+                    a_ratio = float(a.get("meta", {}).get("area_ratio", 0.0))
+                    b_ratio = float(b.get("meta", {}).get("area_ratio", 0.0))
+                    small_fragment_pair = min(a_ratio, b_ratio) <= merge_fragment_max_area_ratio
+                    should_merge = (
+                        iou >= merge_iou_thr
+                        or contain >= merge_containment_thr
+                        or (small_fragment_pair and x_ov >= merge_x_overlap_thr and yg <= merge_gap_px)
+                    )
+                    if not should_merge:
+                        j += 1
+                        continue
+
+                    node_ids = sorted(
+                        set(a.get("node_ids", [])) | set(b.get("node_ids", []))
+                    )
+                    a["bbox"] = _union_bbox(ab, bb)
+                    a["node_ids"] = node_ids
+                    a["score"] = max(float(a.get("score", 0.0)), float(b.get("score", 0.0)))
+                    ma = dict(a.get("meta", {}))
+                    mb = dict(b.get("meta", {}))
+                    ma_ratio = float(ma.get("area_ratio", 0.0))
+                    mb_ratio = float(mb.get("area_ratio", 0.0))
+                    ma["area_ratio"] = float(np.clip(ma_ratio + mb_ratio, 0.0, 1.0))
+                    a["meta"] = ma
+                    del group[j]
+                    changed = True
+                    break
+                if changed:
+                    break
+                i += 1
+
+        merged_all.extend(group)
+
+    return _sorted_regions(merged_all)
+
+
+def _nms_dedup_regions(
+    regions: List[Dict],
+    nms_iou_thr: float,
+    nms_containment_thr: float,
+) -> List[Dict]:
+    ordered = sorted(
+        regions,
+        key=lambda r: (
+            float(r.get("score", 0.0)),
+            _bbox_area(r.get("bbox", [0, 0, 0, 0])),
+        ),
+        reverse=True,
+    )
+    kept: List[Dict] = []
+    for c in ordered:
+        cb = c.get("bbox", [0, 0, 0, 0])
+        drop = False
+        for k in kept:
+            kb = k.get("bbox", [0, 0, 0, 0])
+            if _iou(cb, kb) >= nms_iou_thr:
+                drop = True
+                break
+            if _containment(cb, kb) >= nms_containment_thr:
+                drop = True
+                break
+        if not drop:
+            kept.append(c)
+    return _sorted_regions(kept)
+
+
 def export_panel_crops(
     rgb: np.ndarray,
     bands: List[Band],
@@ -120,6 +240,13 @@ def export_panel_crops(
     min_area_ratio: float = 0.04,
     containment_thr: float = 0.88,
     iou_thr: float = 0.75,
+    merge_iou_thr: float = 0.45,
+    merge_x_overlap_thr: float = 0.82,
+    merge_gap_px: int = 20,
+    merge_containment_thr: float = 0.78,
+    merge_fragment_max_area_ratio: float = 0.12,
+    nms_iou_thr: float = 0.60,
+    nms_containment_thr: float = 0.90,
 ) -> Dict:
     out_path = Path(out_dir)
     panel_dir = out_path / f"{prefix}_panels"
@@ -134,7 +261,20 @@ def export_panel_crops(
         containment_thr=containment_thr,
         iou_thr=iou_thr,
     )
-    ordered = _sorted_regions(primary_regions)
+    merged_regions = _merge_fragmented_regions(
+        primary_regions,
+        merge_iou_thr=merge_iou_thr,
+        merge_x_overlap_thr=merge_x_overlap_thr,
+        merge_gap_px=merge_gap_px,
+        merge_containment_thr=merge_containment_thr,
+        merge_fragment_max_area_ratio=merge_fragment_max_area_ratio,
+    )
+    dedup_regions = _nms_dedup_regions(
+        merged_regions,
+        nms_iou_thr=nms_iou_thr,
+        nms_containment_thr=nms_containment_thr,
+    )
+    ordered = _sorted_regions(dedup_regions)
     panel_idx = 0
     for r in ordered:
         score = float(r.get("score", 0.0))
@@ -203,6 +343,8 @@ def export_panel_crops(
         "panel_count": len(exported),
         "source_region_count": len(regions),
         "primary_region_count": len(primary_regions),
+        "merged_region_count": len(merged_regions),
+        "dedup_region_count": len(dedup_regions),
         "panel_dir": str(panel_dir),
         "score_thr": float(score_thr),
         "pad": int(pad),
@@ -210,6 +352,13 @@ def export_panel_crops(
         "min_area_ratio": float(min_area_ratio),
         "containment_thr": float(containment_thr),
         "iou_thr": float(iou_thr),
+        "merge_iou_thr": float(merge_iou_thr),
+        "merge_x_overlap_thr": float(merge_x_overlap_thr),
+        "merge_gap_px": int(merge_gap_px),
+        "merge_containment_thr": float(merge_containment_thr),
+        "merge_fragment_max_area_ratio": float(merge_fragment_max_area_ratio),
+        "nms_iou_thr": float(nms_iou_thr),
+        "nms_containment_thr": float(nms_containment_thr),
         "panels": exported,
     }
     manifest_path = out_path / f"{prefix}_panels_manifest.json"

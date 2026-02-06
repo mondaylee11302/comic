@@ -148,17 +148,25 @@ def _bands_for_interval(
             na, nb = raw[i + 1]
             raw[i + 1] = (a, nb)
         elif i == len(raw) - 1:
-            pa, pb = merged[-1]
-            merged[-1] = (pa, b)
+            if merged:
+                pa, pb = merged[-1]
+                merged[-1] = (pa, b)
+            else:
+                # No committed left band exists yet; keep tail as-is.
+                merged.append((a, b))
         else:
-            left_h = merged[-1][1] - merged[-1][0]
             right_h = raw[i + 1][1] - raw[i + 1][0]
-            if right_h >= left_h:
+            if not merged:
                 na, nb = raw[i + 1]
                 raw[i + 1] = (a, nb)
             else:
-                pa, pb = merged[-1]
-                merged[-1] = (pa, b)
+                left_h = merged[-1][1] - merged[-1][0]
+                if right_h >= left_h:
+                    na, nb = raw[i + 1]
+                    raw[i + 1] = (a, nb)
+                else:
+                    pa, pb = merged[-1]
+                    merged[-1] = (pa, b)
         i += 1
     return merged
 
