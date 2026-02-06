@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
 from comic_splitter.stage1.splitter import Stage1Config, StructureSplitter
 
 # Edit these defaults for local testing (absolute path recommended).
-DEFAULT_IMAGE_PATH = "/Users/lishuai/Documents/子曰文化/PSD文件例子/26-005.psd"
+DEFAULT_IMAGE_PATH = ""
 DEFAULT_OUTPUT_DIR = str(ROOT / "output")
 DEFAULT_DEBUG_DIR = str(Path(DEFAULT_OUTPUT_DIR) / "debug")
 DEFAULT_PREFIX = "page_001"
