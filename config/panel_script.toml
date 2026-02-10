@@ -1,0 +1,37 @@
+[paths]
+out_dir = "/Users/lishuai/Documents/python/Picslit2/output"
+prefix = "storyboard_001"
+panel_id = "panel_001"
+panel_image_path = ""
+panel_text_path = ""
+output_json_path = ""
+output_md_path = ""
+
+[options]
+selected_text_ids = []
+selected_text_contains = []
+goal = "保留原文语义并增强戏剧性，输出可直接给创作团队使用的分镜脚本"
+temperature = 0.35
+max_tokens = 1200
+request_timeout_sec = 60.0
+model_retries = 2
+heartbeat_interval_sec = 8
+allow_local_fallback = true
+enforce_doubao_18 = true
+model_endpoint = ""
+api_key = ""
+base_url = ""
+
+[retry]
+enabled = true
+default_max_attempts = 1
+default_backoff_sec = 1.0
+backoff_multiplier = 2.0
+max_backoff_sec = 8.0
+
+[retry.per_agent_max_attempts]
+resolve_panel_agent = 1
+select_text_agent = 1
+generate_script_agent = 2
+persist_script_agent = 1
+

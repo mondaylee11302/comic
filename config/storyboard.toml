@@ -1,0 +1,41 @@
+[paths]
+image_path = "/Users/lishuai/Documents/子曰文化/PSD文件例子/162-001.psd"
+out_dir = "/Users/lishuai/Documents/python/Picslit2/output"
+debug_dir = "/Users/lishuai/Documents/python/Picslit2/output/debug"
+prefix = "storyboard_001"
+
+[options]
+strict_ocr = true
+reuse_preprocess_cache = true
+force_reprocess = false
+split_mode = "bands"
+enable_mask_inpaint = false
+enable_hardline = true
+strict_volc = false
+debug_overlay_alpha = 0.0
+panel_score_thr = 0.12
+panel_pad = 6
+panel_min_area_ratio = 0.04
+panel_containment_thr = 0.88
+panel_iou_thr = 0.75
+panel_merge_iou_thr = 0.45
+panel_merge_x_overlap_thr = 0.82
+panel_merge_gap_px = 20
+panel_merge_containment_thr = 0.78
+panel_merge_fragment_max_area_ratio = 0.12
+panel_nms_iou_thr = 0.60
+panel_nms_containment_thr = 0.90
+heartbeat_interval_sec = 8
+
+[retry]
+enabled = true
+default_max_attempts = 1
+default_backoff_sec = 1.0
+backoff_multiplier = 2.0
+max_backoff_sec = 8.0
+
+[retry.per_agent_max_attempts]
+preprocess_agent = 1
+split_agent = 1
+text_packaging_agent = 1
+

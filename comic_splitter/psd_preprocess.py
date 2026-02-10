@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -291,7 +291,16 @@ def prepare_ocr_input_image(
     )
 
 
-def _extract_ocr_texts_from_source(source_bgr: np.ndarray, width: int, height: int) -> OcrExtractResult:
+def _extract_ocr_texts_from_source(
+    source_bgr: np.ndarray,
+    width: int,
+    height: int,
+    progress_hook: Optional[Callable[[str], None]] = None,
+) -> OcrExtractResult:
+    def _log(msg: str) -> None:
+        if progress_hook is not None:
+            progress_hook(msg)
+
     _load_dotenv_from_repo_root()
     enable = str(os.getenv("VOLC_OCR_ENABLE", "0")).strip().lower() in {"1", "true", "yes", "on"}
     if not enable:
@@ -305,6 +314,7 @@ def _extract_ocr_texts_from_source(source_bgr: np.ndarray, width: int, height: i
             degraded_reason="VOLC_OCR_ENABLE is disabled",
         )
 
+    _log("ocr: encode input image")
     try:
         jpeg_bytes, input_meta, _ = prepare_ocr_input_image(source_bgr)
     except ValueError as exc:
@@ -333,25 +343,33 @@ def _extract_ocr_texts_from_source(source_bgr: np.ndarray, width: int, height: i
         )
 
     try:
+        max_retries_raw = str(os.getenv("VOLC_OCR_MAX_RETRIES", "4")).strip()
+        try:
+            ocr_max_retries = max(1, int(max_retries_raw))
+        except Exception:
+            ocr_max_retries = 4
         upload_host = (
             os.getenv("VOLC_OCR_UPLOAD_HOST", "").strip()
             or os.getenv("VOLC_IMAGEX_UPLOAD_HOST", "").strip()
             or None
         )
+        _log(f"ocr: upload start (max_retries={ocr_max_retries})")
         upload_result = upload_image_data(
             service_id=None,
             image_bytes=jpeg_bytes,
             upload_host=upload_host,
-            max_retries=4,
+            max_retries=ocr_max_retries,
         )
+        _log(f"ocr: upload done ({upload_result.elapsed_ms}ms), request OCR")
         ocr_result = ocr_ai_process(
             service_id=None,
             data_type="uri",
             object_key_or_url=upload_result.object_key,
             scene="general",
             model_id="default",
-            max_retries=4,
+            max_retries=ocr_max_retries,
         )
+        _log(f"ocr: response done ({ocr_result.elapsed_ms}ms)")
 
         texts: List[TextItem] = []
         src_w = max(1.0, float(input_meta.get("width", width)))
@@ -1397,25 +1415,50 @@ def preprocess_psd_for_panels(
     min_r_bubble: float = 0.30,
     min_bubble_area_ratio: float = 0.02,
     enable_mask_inpaint: bool = False,
+    progress_hook: Optional[Callable[[str], None]] = None,
 ) -> PsdPreprocessResult:
+    def _log(msg: str) -> None:
+        if progress_hook is not None:
+            progress_hook(msg)
+
     _ = min_components
     _ = min_r_bubble
     _ = min_bubble_area_ratio
     _ = enable_mask_inpaint
 
+    _log("open psd")
     psd = PSDImage.open(image_path)
     width, height = [int(v) for v in psd.size]
+    _log(f"psd opened: size={width}x{height}")
 
+    _log("compose source image")
     source_bgr = _to_bgr_from_pil(psd.composite())
+    _log("extract psd texts")
     psd_texts = extract_psd_texts(psd, width, height)
-    ocr_result = _extract_ocr_texts_from_source(source_bgr, width=width, height=height)
+    _log(f"psd texts done: count={len(psd_texts)}")
+    ocr_result = _extract_ocr_texts_from_source(source_bgr, width=width, height=height, progress_hook=progress_hook)
+    _log(
+        "ocr done: status=%s, texts=%d, upload_ms=%d, ocr_ms=%d"
+        % (ocr_result.status, len(ocr_result.texts), int(ocr_result.upload_latency_ms), int(ocr_result.ocr_latency_ms))
+    )
 
     merged_texts, merge_stats = merge_text_items(psd_texts, ocr_result.texts, width=width, height=height)
+    _log(
+        "merge texts done: merged=%d, unmatched_psd=%d, unmatched_ocr=%d"
+        % (
+            len(merged_texts),
+            int(merge_stats.get("merge_unmatched_psd_count", 0)),
+            int(merge_stats.get("merge_unmatched_ocr_count", 0)),
+        )
+    )
 
     text_layer_ids = {int(t.layer_id) for t in psd_texts if int(t.layer_id) >= 0}
+    _log("detect raster text layers")
     raster_text_layer_ids = _detect_raster_text_layers(psd=psd, texts=merged_texts, alpha_thr=alpha_thr)
     anchor_group_ids = _collect_anchor_group_ids(psd=psd, layer_ids=raster_text_layer_ids)
+    _log(f"raster text layers done: count={len(raster_text_layer_ids)}")
 
+    _log("rank bubble/textbox layers")
     ranking, layer_path_by_id = rank_bubble_layers(
         psd=psd,
         texts=merged_texts,
@@ -1426,13 +1469,17 @@ def preprocess_psd_for_panels(
         exclude_layer_ids=set(raster_text_layer_ids),
         text_anchor_group_ids=anchor_group_ids,
     )
+    _log(f"layer ranking done: candidates={len(ranking)}")
 
     textbox_layer_ids = _select_textbox_layers(psd=psd, ranking=ranking, threshold=0.30)
     bubble_layer_id: int | None = int(textbox_layer_ids[0]) if textbox_layer_ids else None
     bubble_layer_path: str | None = layer_path_by_id.get(bubble_layer_id, None) if bubble_layer_id is not None else None
+    _log(f"textbox layers selected: count={len(textbox_layer_ids)}")
 
     remove_ids = sorted(set(text_layer_ids | set(raster_text_layer_ids) | set(textbox_layer_ids)))
+    _log(f"build clean art: remove_layers={len(remove_ids)}")
     clean_bgr = build_clean_art(psd=psd, remove_layer_ids=remove_ids)
+    _log("clean art done")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     art_clean_path = out_dir / f"{prefix}_art_clean.png"
@@ -1442,6 +1489,7 @@ def preprocess_psd_for_panels(
     textbox_rank_path = out_dir / f"{prefix}_textbox_layer_ranking.json"
     bubble_rank_path = out_dir / f"{prefix}_bubble_layer_ranking.json"
 
+    _log("write preprocess outputs")
     cv2.imwrite(str(art_clean_path), clean_bgr)
 
     # Keep legacy output name; now it points to merged text results.
@@ -1457,6 +1505,7 @@ def preprocess_psd_for_panels(
     textbox_rank_path.write_text(json.dumps(ranking_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # Keep legacy output name for compatibility.
     bubble_rank_path.write_text(json.dumps(ranking_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _log("write preprocess outputs done")
 
     removed_paths = [layer_path_by_id.get(lid, f"layer#{lid}") for lid in remove_ids]
 

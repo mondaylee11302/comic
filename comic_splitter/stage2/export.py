@@ -247,6 +247,7 @@ def export_panel_crops(
     merge_fragment_max_area_ratio: float = 0.12,
     nms_iou_thr: float = 0.60,
     nms_containment_thr: float = 0.90,
+    image_ext: str = "jpg",
 ) -> Dict:
     out_path = Path(out_dir)
     panel_dir = out_path / f"{prefix}_panels"
@@ -275,6 +276,10 @@ def export_panel_crops(
         nms_containment_thr=nms_containment_thr,
     )
     ordered = _sorted_regions(dedup_regions)
+    ext = str(image_ext or "jpg").strip().lower().lstrip(".")
+    if not ext:
+        ext = "jpg"
+
     panel_idx = 0
     for r in ordered:
         score = float(r.get("score", 0.0))
@@ -297,7 +302,10 @@ def export_panel_crops(
         panel_name = f"panel_{panel_idx:03d}"
 
         crop = rgb[y1:y2, x1:x2]
-        bbox_path = panel_dir / f"{panel_name}_bbox.jpg"
+        if ext == "jpg":
+            bbox_path = panel_dir / f"{panel_name}_bbox.jpg"
+        else:
+            bbox_path = panel_dir / f"{panel_name}.{ext}"
         cv2.imwrite(str(bbox_path), crop)
 
         mask_path = None
@@ -359,6 +367,7 @@ def export_panel_crops(
         "merge_fragment_max_area_ratio": float(merge_fragment_max_area_ratio),
         "nms_iou_thr": float(nms_iou_thr),
         "nms_containment_thr": float(nms_containment_thr),
+        "image_ext": ext,
         "panels": exported,
     }
     manifest_path = out_path / f"{prefix}_panels_manifest.json"
