@@ -197,6 +197,18 @@ def _iter_ancestor_groups(layer: Layer) -> Iterable[Layer]:
         cur = parent
 
 
+def _build_runtime_layer_maps(psd: PSDImage) -> Tuple[Dict[int, int], Dict[int, Layer], Dict[int, str]]:
+    runtime_id_by_obj: Dict[int, int] = {}
+    layer_by_runtime_id: Dict[int, Layer] = {}
+    path_by_runtime_id: Dict[int, str] = {}
+    for idx, layer in enumerate(psd.descendants(), start=1):
+        rid = int(idx)
+        runtime_id_by_obj[id(layer)] = rid
+        layer_by_runtime_id[rid] = layer
+        path_by_runtime_id[rid] = _layer_path(layer)
+    return runtime_id_by_obj, layer_by_runtime_id, path_by_runtime_id
+
+
 def _to_bgr_from_pil(image) -> np.ndarray:
     arr = np.array(image)
     if arr.ndim == 3 and arr.shape[2] == 4:
@@ -206,7 +218,12 @@ def _to_bgr_from_pil(image) -> np.ndarray:
     raise ValueError(f"Unsupported image mode from PSD composite: shape={arr.shape}")
 
 
-def _extract_texts(psd: PSDImage, width: int, height: int) -> List[TextItem]:
+def _extract_texts(
+    psd: PSDImage,
+    width: int,
+    height: int,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
+) -> List[TextItem]:
     out: List[TextItem] = []
     idx = 0
     for layer in psd.descendants():
@@ -221,13 +238,17 @@ def _extract_texts(psd: PSDImage, width: int, height: int) -> List[TextItem]:
         if not text:
             continue
         idx += 1
+        runtime_lid = int(getattr(layer, "layer_id", -1))
+        if runtime_id_by_obj is not None:
+            runtime_lid = int(runtime_id_by_obj.get(id(layer), runtime_lid))
+
         item = TextItem(
             text_id=f"psd_{idx:03d}",
             text=text,
             bbox=[bbox[0], bbox[1], bbox[2], bbox[3]],
             source="psd_text",
             conf=1.0,
-            layer_id=int(getattr(layer, "layer_id", -1)),
+            layer_id=runtime_lid,
             layer_path=_layer_path(layer),
             quad=None,
             geom_source="psd_bbox",
@@ -238,8 +259,13 @@ def _extract_texts(psd: PSDImage, width: int, height: int) -> List[TextItem]:
     return out
 
 
-def extract_psd_texts(psd: PSDImage, width: int, height: int) -> List[TextItem]:
-    return _extract_texts(psd, width, height)
+def extract_psd_texts(
+    psd: PSDImage,
+    width: int,
+    height: int,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
+) -> List[TextItem]:
+    return _extract_texts(psd, width, height, runtime_id_by_obj=runtime_id_by_obj)
 
 
 def _resize_for_ocr_limits(image_bgr: np.ndarray, max_long: int = 3840, max_short: int = 2160) -> np.ndarray:
@@ -329,8 +355,7 @@ def _extract_ocr_texts_from_source(
         )
 
     try:
-        from volc_imagex.ocr import ocr_ai_process
-        from volc_imagex.uploader import upload_image_data
+        from volc_imagex.ocr import ocr_ai_process_bytes
     except Exception as exc:
         return OcrExtractResult(
             texts=[],
@@ -348,28 +373,14 @@ def _extract_ocr_texts_from_source(
             ocr_max_retries = max(1, int(max_retries_raw))
         except Exception:
             ocr_max_retries = 4
-        upload_host = (
-            os.getenv("VOLC_OCR_UPLOAD_HOST", "").strip()
-            or os.getenv("VOLC_IMAGEX_UPLOAD_HOST", "").strip()
-            or None
-        )
-        _log(f"ocr: upload start (max_retries={ocr_max_retries})")
-        upload_result = upload_image_data(
-            service_id=None,
-            image_bytes=jpeg_bytes,
-            upload_host=upload_host,
-            max_retries=ocr_max_retries,
-        )
-        _log(f"ocr: upload done ({upload_result.elapsed_ms}ms), request OCR")
-        ocr_result = ocr_ai_process(
-            service_id=None,
-            data_type="uri",
-            object_key_or_url=upload_result.object_key,
+        _log(f"ocr: request start (max_retries={ocr_max_retries})")
+        ocr_result = ocr_ai_process_bytes(
+            file_bytes=jpeg_bytes,
             scene="general",
-            model_id="default",
+            file_type=1,
             max_retries=ocr_max_retries,
         )
-        _log(f"ocr: response done ({ocr_result.elapsed_ms}ms)")
+        _log(f"ocr: response done ({ocr_result.elapsed_ms}ms), texts={len(ocr_result.texts)}")
 
         texts: List[TextItem] = []
         src_w = max(1.0, float(input_meta.get("width", width)))
@@ -402,7 +413,7 @@ def _extract_ocr_texts_from_source(
             texts=texts,
             status=status,
             request_id=ocr_result.request_id,
-            upload_latency_ms=int(upload_result.elapsed_ms),
+            upload_latency_ms=0,
             ocr_latency_ms=int(ocr_result.elapsed_ms),
             input_size=input_meta,
             degraded_reason="",
@@ -916,17 +927,26 @@ def _collect_text_stats_for_layer(
     return overlap_count, center_hits, iou_max, overlap_ratio, center_ratio
 
 
-def _collect_anchor_group_ids(psd: PSDImage, layer_ids: List[int]) -> set[int]:
+def _collect_anchor_group_ids(
+    psd: PSDImage,
+    layer_ids: List[int],
+    layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
+) -> set[int]:
     if not layer_ids:
         return set()
-    layer_by_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
+    if layer_by_runtime_id is None:
+        layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
     out: set[int] = set()
     for lid in layer_ids:
-        layer = layer_by_id.get(int(lid))
+        layer = layer_by_runtime_id.get(int(lid))
         if layer is None:
             continue
         for g in _iter_ancestor_groups(layer):
-            out.add(int(getattr(g, "layer_id", -1)))
+            gid = int(getattr(g, "layer_id", -1))
+            if runtime_id_by_obj is not None:
+                gid = int(runtime_id_by_obj.get(id(g), gid))
+            out.add(gid)
     return out
 
 
@@ -934,6 +954,7 @@ def _detect_raster_text_layers(
     psd: PSDImage,
     texts: List[TextItem],
     alpha_thr: int = 10,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
 ) -> List[int]:
     if not texts:
         return []
@@ -945,6 +966,8 @@ def _detect_raster_text_layers(
     scored: List[Tuple[float, int]] = []
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
+        if runtime_id_by_obj is not None:
+            lid = int(runtime_id_by_obj.get(id(layer), lid))
         if not bool(getattr(layer, "visible", True)):
             continue
         if str(getattr(layer, "kind", "")) == "group":
@@ -1017,6 +1040,7 @@ def rank_bubble_layers(
     alpha_thr: int = 10,
     exclude_layer_ids: Optional[set[int]] = None,
     text_anchor_group_ids: Optional[set[int]] = None,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[BubbleLayerScore], Dict[int, str]]:
     _ = white_v_thr
     _ = white_s_thr
@@ -1033,6 +1057,8 @@ def rank_bubble_layers(
 
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
+        if runtime_id_by_obj is not None:
+            lid = int(runtime_id_by_obj.get(id(layer), lid))
         kind = str(getattr(layer, "kind", ""))
         layer_path_by_id[lid] = _layer_path(layer)
 
@@ -1063,7 +1089,12 @@ def rank_bubble_layers(
         if bbox_area_ratio > 0.35 and center_ratio < 0.30:
             continue
 
-        anc_ids = {int(getattr(g, "layer_id", -1)) for g in _iter_ancestor_groups(layer)}
+        anc_ids = set()
+        for g in _iter_ancestor_groups(layer):
+            gid = int(getattr(g, "layer_id", -1))
+            if runtime_id_by_obj is not None:
+                gid = int(runtime_id_by_obj.get(id(g), gid))
+            anc_ids.add(gid)
         if text_anchor_group_ids and (not (anc_ids & text_anchor_group_ids)) and center_hits < 12:
             continue
 
@@ -1170,17 +1201,22 @@ def rank_bubble_layers(
     return ranking, layer_path_by_id
 
 
-def _build_ancestor_map(psd: PSDImage) -> Dict[int, set[int]]:
+def _build_ancestor_map(psd: PSDImage, runtime_id_by_obj: Optional[Dict[int, int]] = None) -> Dict[int, set[int]]:
     ancestors: Dict[int, set[int]] = {}
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
+        if runtime_id_by_obj is not None:
+            lid = int(runtime_id_by_obj.get(id(layer), lid))
         cur = layer
         anc: set[int] = set()
         while hasattr(cur, "parent") and cur.parent is not None:
             parent = cur.parent
             if isinstance(parent, PSDImage):
                 break
-            anc.add(int(getattr(parent, "layer_id", -1)))
+            pid = int(getattr(parent, "layer_id", -1))
+            if runtime_id_by_obj is not None:
+                pid = int(runtime_id_by_obj.get(id(parent), pid))
+            anc.add(pid)
             cur = parent
         ancestors[lid] = anc
     return ancestors
@@ -1190,8 +1226,9 @@ def _select_textbox_layers(
     psd: PSDImage,
     ranking: List[BubbleLayerScore],
     threshold: float = 0.42,
+    runtime_id_by_obj: Optional[Dict[int, int]] = None,
 ) -> List[int]:
-    ancestors = _build_ancestor_map(psd)
+    ancestors = _build_ancestor_map(psd, runtime_id_by_obj=runtime_id_by_obj)
     selected: List[int] = []
 
     candidates: List[Tuple[float, BubbleLayerScore]] = []
@@ -1308,15 +1345,17 @@ def _mask_from_removed_layers(
     remove_layer_ids: List[int],
     image_shape: Tuple[int, int],
     alpha_thr: int = 10,
+    layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
 ) -> np.ndarray:
     h, w = image_shape
     mask = np.zeros((h, w), dtype=np.uint8)
     if not remove_layer_ids:
         return mask
 
-    layer_by_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
+    if layer_by_runtime_id is None:
+        layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
     for lid in sorted(set(remove_layer_ids)):
-        layer = layer_by_id.get(int(lid))
+        layer = layer_by_runtime_id.get(int(lid))
         if layer is None:
             continue
         if str(getattr(layer, "kind", "")) == "group":
@@ -1350,16 +1389,18 @@ def build_clean_art(
     enable_mask_inpaint: bool = False,
     inpaint_texts: Optional[List[TextItem]] = None,
     source_bgr: Optional[np.ndarray] = None,
+    layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
 ) -> np.ndarray:
     _ = enable_mask_inpaint
     _ = inpaint_texts
     _ = source_bgr
 
     # Strict mode: remove/hide target layers, then composite. No inpaint.
-    layer_by_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
+    if layer_by_runtime_id is None:
+        layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
     visible_backup: Dict[int, bool] = {}
     for lid in sorted(set(remove_layer_ids)):
-        layer = layer_by_id.get(lid)
+        layer = layer_by_runtime_id.get(lid)
         if layer is None:
             continue
         visible_backup[lid] = bool(getattr(layer, "visible", True))
@@ -1369,7 +1410,7 @@ def build_clean_art(
         clean_bgr = _to_bgr_from_pil(psd.composite())
     finally:
         for lid, vis in visible_backup.items():
-            layer = layer_by_id.get(lid)
+            layer = layer_by_runtime_id.get(lid)
             if layer is not None:
                 layer.visible = bool(vis)
     return clean_bgr
@@ -1429,12 +1470,13 @@ def preprocess_psd_for_panels(
     _log("open psd")
     psd = PSDImage.open(image_path)
     width, height = [int(v) for v in psd.size]
+    runtime_id_by_obj, layer_by_runtime_id, layer_path_by_runtime_id = _build_runtime_layer_maps(psd)
     _log(f"psd opened: size={width}x{height}")
 
     _log("compose source image")
     source_bgr = _to_bgr_from_pil(psd.composite())
     _log("extract psd texts")
-    psd_texts = extract_psd_texts(psd, width, height)
+    psd_texts = extract_psd_texts(psd, width, height, runtime_id_by_obj=runtime_id_by_obj)
     _log(f"psd texts done: count={len(psd_texts)}")
     ocr_result = _extract_ocr_texts_from_source(source_bgr, width=width, height=height, progress_hook=progress_hook)
     _log(
@@ -1454,8 +1496,18 @@ def preprocess_psd_for_panels(
 
     text_layer_ids = {int(t.layer_id) for t in psd_texts if int(t.layer_id) >= 0}
     _log("detect raster text layers")
-    raster_text_layer_ids = _detect_raster_text_layers(psd=psd, texts=merged_texts, alpha_thr=alpha_thr)
-    anchor_group_ids = _collect_anchor_group_ids(psd=psd, layer_ids=raster_text_layer_ids)
+    raster_text_layer_ids = _detect_raster_text_layers(
+        psd=psd,
+        texts=merged_texts,
+        alpha_thr=alpha_thr,
+        runtime_id_by_obj=runtime_id_by_obj,
+    )
+    anchor_group_ids = _collect_anchor_group_ids(
+        psd=psd,
+        layer_ids=raster_text_layer_ids,
+        layer_by_runtime_id=layer_by_runtime_id,
+        runtime_id_by_obj=runtime_id_by_obj,
+    )
     _log(f"raster text layers done: count={len(raster_text_layer_ids)}")
 
     _log("rank bubble/textbox layers")
@@ -1468,17 +1520,31 @@ def preprocess_psd_for_panels(
         alpha_thr=alpha_thr,
         exclude_layer_ids=set(raster_text_layer_ids),
         text_anchor_group_ids=anchor_group_ids,
+        runtime_id_by_obj=runtime_id_by_obj,
     )
     _log(f"layer ranking done: candidates={len(ranking)}")
 
-    textbox_layer_ids = _select_textbox_layers(psd=psd, ranking=ranking, threshold=0.30)
+    textbox_layer_ids = _select_textbox_layers(
+        psd=psd,
+        ranking=ranking,
+        threshold=0.30,
+        runtime_id_by_obj=runtime_id_by_obj,
+    )
     bubble_layer_id: int | None = int(textbox_layer_ids[0]) if textbox_layer_ids else None
-    bubble_layer_path: str | None = layer_path_by_id.get(bubble_layer_id, None) if bubble_layer_id is not None else None
+    bubble_layer_path: str | None = (
+        layer_path_by_runtime_id.get(bubble_layer_id, layer_path_by_id.get(bubble_layer_id, None))
+        if bubble_layer_id is not None
+        else None
+    )
     _log(f"textbox layers selected: count={len(textbox_layer_ids)}")
 
     remove_ids = sorted(set(text_layer_ids | set(raster_text_layer_ids) | set(textbox_layer_ids)))
     _log(f"build clean art: remove_layers={len(remove_ids)}")
-    clean_bgr = build_clean_art(psd=psd, remove_layer_ids=remove_ids)
+    clean_bgr = build_clean_art(
+        psd=psd,
+        remove_layer_ids=remove_ids,
+        layer_by_runtime_id=layer_by_runtime_id,
+    )
     _log("clean art done")
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1507,7 +1573,7 @@ def preprocess_psd_for_panels(
     bubble_rank_path.write_text(json.dumps(ranking_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     _log("write preprocess outputs done")
 
-    removed_paths = [layer_path_by_id.get(lid, f"layer#{lid}") for lid in remove_ids]
+    removed_paths = [layer_path_by_runtime_id.get(lid, f"layer#{lid}") for lid in remove_ids]
 
     if ocr_result.status in {"ok", "ok_empty"}:
         ocr_status = ocr_result.status
@@ -1533,9 +1599,11 @@ def preprocess_psd_for_panels(
         ocr_status=ocr_status,
         text_backend="psd+ocr_merge",
         textbox_layer_ids=sorted(textbox_layer_ids),
-        textbox_layer_paths=[layer_path_by_id.get(lid, f"layer#{lid}") for lid in sorted(textbox_layer_ids)],
+        textbox_layer_paths=[layer_path_by_runtime_id.get(lid, f"layer#{lid}") for lid in sorted(textbox_layer_ids)],
         raster_text_layer_ids=sorted(raster_text_layer_ids),
-        raster_text_layer_paths=[layer_path_by_id.get(lid, f"layer#{lid}") for lid in sorted(raster_text_layer_ids)],
+        raster_text_layer_paths=[
+            layer_path_by_runtime_id.get(lid, f"layer#{lid}") for lid in sorted(raster_text_layer_ids)
+        ],
         texts_merged_path=str(texts_merged_path),
         textbox_ranking_path=str(textbox_rank_path),
         text_canvas_map_path=str(text_canvas_map_path),

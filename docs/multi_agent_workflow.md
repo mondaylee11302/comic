@@ -79,3 +79,33 @@ Runtime priority is:
 1. hardcoded defaults (script)
 2. TOML config
 3. CLI explicit arguments (highest)
+
+## 6) React Workbench (New)
+
+Entry: `/Users/lishuai/Documents/python/Picslit2/scripts/run_react_workbench.py`
+
+Run:
+
+```bash
+uv run python /Users/lishuai/Documents/python/Picslit2/scripts/run_react_workbench.py --host 127.0.0.1 --port 7860
+```
+
+Architecture:
+
+- Backend API: `comic_splitter/ui/react_api.py` (FastAPI)
+- Frontend UI: `web/react/index.html`, `web/react/app.jsx`, `web/react/styles.css`
+
+Key API routes:
+
+- `POST /api/upload-psd`
+- `POST /api/storyboard/run`
+- `GET /api/panel/details`
+- `POST /api/script/generate`
+- `GET /api/assets/list`
+- `GET /api/script/preview`
+- `GET /api/file`
+
+Design rule:
+
+- React UI only orchestrates existing `StoryboardWorkflow` and `PanelScriptWorkflow`.
+- Core business logic modules remain unchanged.

@@ -68,6 +68,27 @@ class OCRParseTests(unittest.TestCase):
         self.assertEqual(request_id, "req-test-1")
         self.assertEqual(parsed_output, nested_output)
 
+    def test_parse_paddle_pruned_result_block_content_and_bbox(self) -> None:
+        raw_output = {
+            "layoutParsingResults": [
+                {
+                    "prunedResult": {
+                        "parsing_res_list": [
+                            {
+                                "block_label": "paragraph_title",
+                                "block_content": "HELLO OCR 123\nTEST TEXT",
+                                "block_bbox": [48, 66, 572, 234],
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+        texts = _parse_general_output(raw_output)
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts[0].text, "HELLO OCR 123\nTEST TEXT")
+        self.assertEqual(texts[0].quad, [[48.0, 66.0], [572.0, 66.0], [572.0, 234.0], [48.0, 234.0]])
+
 
 if __name__ == "__main__":
     unittest.main()
