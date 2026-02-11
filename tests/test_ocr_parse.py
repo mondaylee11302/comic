@@ -4,6 +4,7 @@ import json
 import unittest
 
 from volc_imagex.ocr import (
+    _filter_multilang_ocr_infos,
     _parse_general_output,
     _parse_license_output,
     parse_ai_process_response,
@@ -88,6 +89,84 @@ class OCRParseTests(unittest.TestCase):
         self.assertEqual(len(texts), 1)
         self.assertEqual(texts[0].text, "HELLO OCR 123\nTEST TEXT")
         self.assertEqual(texts[0].quad, [[48.0, 66.0], [572.0, 66.0], [572.0, 234.0], [48.0, 234.0]])
+
+    def test_parse_volc_data_detail_string(self) -> None:
+        volc_detail = [
+            {
+                "page_id": 0,
+                "textblocks": [
+                    {
+                        "text": "Article 2: Active region PIC experiment",
+                        "label": "para",
+                        "box": {"x0": 172, "y0": 175, "x1": 591, "y1": 207},
+                    }
+                ],
+            }
+        ]
+        resp = {
+            "code": 10000,
+            "request_id": "req-volc-1",
+            "data": {
+                "markdown": "Article 2: Active region PIC experiment",
+                "detail": json.dumps(volc_detail, ensure_ascii=False),
+            },
+        }
+        parsed_output, request_id = parse_ai_process_response(resp)
+        self.assertEqual(request_id, "req-volc-1")
+        self.assertIn("detail", parsed_output)
+        self.assertIsInstance(parsed_output["detail"], list)
+        self.assertEqual(parsed_output["detail"][0]["page_id"], 0)
+
+    def test_parse_general_volc_textblocks_box_dict(self) -> None:
+        raw_output = {
+            "detail": [
+                {
+                    "page_id": 0,
+                    "textblocks": [
+                        {
+                            "text": "Volc OCR paragraph",
+                            "label": "para",
+                            "box": {"x0": 12, "y0": 34, "x1": 156, "y1": 78},
+                        }
+                    ],
+                }
+            ]
+        }
+        texts = _parse_general_output(raw_output)
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts[0].text, "Volc OCR paragraph")
+        self.assertEqual(texts[0].quad, [[12.0, 34.0], [156.0, 34.0], [156.0, 78.0], [12.0, 78.0]])
+
+    def test_parse_general_multilang_ocr_infos(self) -> None:
+        raw_output = {
+            "ocr_infos": [
+                {
+                    "lang": "ko",
+                    "prob": "0.984",
+                    "rect": [[10, 20], [100, 20], [100, 45], [10, 45]],
+                    "text": "안녕하세요",
+                }
+            ]
+        }
+        texts = _parse_general_output(raw_output)
+        self.assertEqual(len(texts), 1)
+        self.assertEqual(texts[0].text, "안녕하세요")
+        self.assertEqual(texts[0].quad, [[10.0, 20.0], [100.0, 20.0], [100.0, 45.0], [10.0, 45.0]])
+        self.assertAlmostEqual(texts[0].confidence or 0.0, 0.984, places=6)
+
+    def test_filter_multilang_zh_keeps_not_lang(self) -> None:
+        parsed = {
+            "ocr_infos": [
+                {"lang": "zh", "text": "中文"},
+                {"lang": "ko", "text": "한국어"},
+                {"lang": "not_lang", "text": "123"},
+            ]
+        }
+        out = _filter_multilang_ocr_infos(parsed, "zh")
+        infos = out.get("ocr_infos", [])
+        self.assertEqual(len(infos), 2)
+        langs = [str(x.get("lang")) for x in infos]
+        self.assertEqual(langs, ["zh", "not_lang"])
 
 
 if __name__ == "__main__":

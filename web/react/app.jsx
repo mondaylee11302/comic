@@ -90,6 +90,8 @@ function WorkflowPage() {
   const [debugDir, setDebugDir] = useState(DEFAULT_DEBUG_DIR);
   const [prefix, setPrefix] = useState("storyboard_001");
   const [strictOcr, setStrictOcr] = useState(true);
+  const [ocrMode, setOcrMode] = useState("pdf");
+  const [ocrLang, setOcrLang] = useState("zh");
   const [splitMode, setSplitMode] = useState("bands");
   const [reuseCache, setReuseCache] = useState(true);
   const [forceReprocess, setForceReprocess] = useState(false);
@@ -192,6 +194,8 @@ function WorkflowPage() {
         out_dir: outDir,
         debug_dir: debugDir,
         strict_ocr: strictOcr,
+        ocr_mode: ocrMode,
+        ocr_lang: ocrLang,
         split_mode: splitMode,
         reuse_cache: reuseCache,
         force_reprocess: forceReprocess,
@@ -315,6 +319,18 @@ function WorkflowPage() {
         </div>
         <div className="row-wrap" style={{ marginTop: 10 }}>
           <label className="badge"><input type="checkbox" checked={strictOcr} onChange={(e) => setStrictOcr(e.target.checked)} /> 严格OCR</label>
+          <label className="badge">ocr_mode:
+            <select style={{ marginLeft: 6, width: 110 }} value={ocrMode} onChange={(e) => setOcrMode(e.target.value)}>
+              <option value="pdf">pdf</option>
+              <option value="multilang">multilang</option>
+            </select>
+          </label>
+          <label className="badge">ocr_lang:
+            <select style={{ marginLeft: 6, width: 90 }} value={ocrLang} onChange={(e) => setOcrLang(e.target.value)}>
+              <option value="zh">中文(zh)</option>
+              <option value="ko">韩语(ko)</option>
+            </select>
+          </label>
           <label className="badge"><input type="checkbox" checked={reuseCache} onChange={(e) => setReuseCache(e.target.checked)} /> 复用缓存</label>
           <label className="badge"><input type="checkbox" checked={forceReprocess} onChange={(e) => setForceReprocess(e.target.checked)} /> 强制重跑</label>
           <label className="badge">split_mode:

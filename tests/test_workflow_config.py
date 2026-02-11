@@ -30,6 +30,8 @@ prefix = "p1"
 [options]
 split_mode = "stage2"
 strict_ocr = false
+ocr_mode = "multilang"
+ocr_lang = "ko"
 panel_pad = 12
 
 [retry]
@@ -56,6 +58,8 @@ split_agent = 4
             self.assertEqual(paths.prefix, "p1")
             self.assertEqual(opts.split_mode, "stage2")
             self.assertFalse(opts.strict_ocr)
+            self.assertEqual(opts.ocr_mode, "multilang")
+            self.assertEqual(opts.ocr_lang, "ko")
             self.assertEqual(opts.panel_pad, 12)
             self.assertEqual(retry.default_max_attempts, 3)
             self.assertEqual(retry.per_agent_max_attempts.get("split_agent"), 4)
@@ -101,4 +105,3 @@ generate_script_agent = 3
 
 if __name__ == "__main__":
     unittest.main()
-

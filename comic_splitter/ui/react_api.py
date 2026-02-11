@@ -46,11 +46,19 @@ class StoryboardRunRequest(BaseModel):
     out_dir: str = str(DEFAULT_OUT_DIR)
     debug_dir: str = str(DEFAULT_DEBUG_DIR)
     strict_ocr: bool = True
+    ocr_mode: Literal["pdf", "multilang"] = "pdf"
+    ocr_lang: Literal["zh", "ko"] = "zh"
     split_mode: Literal["bands", "stage2"] = "bands"
     reuse_cache: bool = True
     force_reprocess: bool = False
     heartbeat_sec: int = 8
     verbose: bool = True
+
+
+class MultiLangOcrRequest(BaseModel):
+    image_path: str
+    ocr_lang: Literal["zh", "ko"] = "zh"
+    max_retries: int = 2
 
 
 class ScriptGenerateRequest(BaseModel):
@@ -292,6 +300,8 @@ def create_react_workbench_app(
         )
         options = StoryboardOptions(
             strict_ocr=bool(payload.strict_ocr),
+            ocr_mode=str(payload.ocr_mode),
+            ocr_lang=str(payload.ocr_lang),
             reuse_preprocess_cache=bool(payload.reuse_cache),
             force_reprocess=bool(payload.force_reprocess),
             split_mode=payload.split_mode,
@@ -305,7 +315,8 @@ def create_react_workbench_app(
         )
         print(
             f"[storyboard] start image={image_path} prefix={prefix} out_dir={out_dir} "
-            f"strict_ocr={bool(payload.strict_ocr)} split_mode={payload.split_mode}",
+            f"strict_ocr={bool(payload.strict_ocr)} ocr_mode={payload.ocr_mode} ocr_lang={payload.ocr_lang} "
+            f"split_mode={payload.split_mode}",
             flush=True,
         )
         try:
@@ -330,6 +341,46 @@ def create_react_workbench_app(
             "unified_preview": unified_preview,
             "text_count": len(state.texts_payload),
             "logs": logs[-120:],
+        }
+
+    @api.post("/ocr/multilang")
+    def ocr_multilang(payload: MultiLangOcrRequest) -> Dict:
+        image_path = _norm_path(payload.image_path)
+        if not image_path.exists() or not image_path.is_file():
+            raise HTTPException(status_code=404, detail=f"image not found: {image_path}")
+        raw = image_path.read_bytes()
+        if not raw:
+            raise HTTPException(status_code=400, detail="empty image file")
+        file_type = 0 if image_path.suffix.lower() == ".pdf" else 1
+        try:
+            from volc_imagex.ocr import ocr_ai_process_bytes
+
+            res = ocr_ai_process_bytes(
+                file_bytes=raw,
+                scene="general",
+                file_type=file_type,
+                max_retries=max(1, int(payload.max_retries)),
+                ocr_endpoint="multilang",
+                lang_mode=str(payload.ocr_lang),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        rows = [
+            {
+                "text": str(t.text),
+                "quad": [[float(p[0]), float(p[1])] for p in t.quad],
+                "confidence": float(t.confidence) if t.confidence is not None else None,
+            }
+            for t in res.texts
+        ]
+        return {
+            "ok": True,
+            "request_id": res.request_id,
+            "elapsed_ms": int(res.elapsed_ms),
+            "ocr_lang": str(payload.ocr_lang),
+            "text_count": len(rows),
+            "texts": rows,
+            "raw_output": res.raw_output,
         }
 
     @api.get("/panel/details")

@@ -7,9 +7,9 @@ import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
-import requests
+from volcengine.visual.VisualService import VisualService
 
 from volc_imagex._utils import (
     backoff_seconds,
@@ -23,9 +23,11 @@ from volc_imagex.types import OCRResult, OCRTextBox
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_API_URL = "https://dayat1g9w13arco5.aistudio-app.com/layout-parsing"
+DEFAULT_VOLC_OCR_HOST = "visual.volcengineapi.com"
 VALID_SCENES = {"general", "license"}
 VALID_DATA_TYPES = {"uri", "url", "file"}
+VALID_OCR_ENDPOINTS = {"pdf", "multilang"}
+VALID_LANG_MODES = {"zh", "ko"}
 _QUAD_KEYS = (
     "Location",
     "location",
@@ -43,16 +45,16 @@ _QUAD_KEYS = (
     "block_polygon_points",
     "coordinate",
     "coordinates",
+    "Rect",
+    "rect",
 )
 
 
-class PaddleHTTPError(RuntimeError):
-    def __init__(self, status_code: int, body: str) -> None:
-        self.status_code = int(status_code)
-        body_short = (body or "").strip()
-        if len(body_short) > 500:
-            body_short = body_short[:500] + "..."
-        super().__init__(f"paddle_ocr http status={status_code}, body={body_short}")
+class VolcOCRBusinessError(RuntimeError):
+    def __init__(self, code: Any, message: str) -> None:
+        self.code = code
+        msg = (message or "").strip()
+        super().__init__(f"volc_ocr business error code={code}, message={msg}")
 
 
 def _validate_scene(scene: str) -> str:
@@ -66,6 +68,24 @@ def _validate_data_type(data_type: str) -> str:
     val = (data_type or "").strip().lower()
     if val not in VALID_DATA_TYPES:
         raise ValueError(f"data_type must be one of {sorted(VALID_DATA_TYPES)}, got: {data_type}")
+    return val
+
+
+def _validate_ocr_endpoint(endpoint: str) -> str:
+    val = (endpoint or "").strip().lower()
+    if val not in VALID_OCR_ENDPOINTS:
+        raise ValueError(f"ocr_endpoint must be one of {sorted(VALID_OCR_ENDPOINTS)}, got: {endpoint}")
+    return val
+
+
+def _validate_lang_mode(lang_mode: Optional[str]) -> Optional[str]:
+    if lang_mode is None:
+        return None
+    val = str(lang_mode).strip().lower()
+    if not val:
+        return None
+    if val not in VALID_LANG_MODES:
+        raise ValueError(f"ocr lang_mode must be one of {sorted(VALID_LANG_MODES)}, got: {lang_mode}")
     return val
 
 
@@ -88,31 +108,45 @@ def _load_dotenv_from_repo_root() -> None:
         return
 
 
-def _resolve_paddle_config() -> Tuple[str, str]:
+def _resolve_volc_credentials() -> Tuple[str, str, Optional[str], str]:
     _load_dotenv_from_repo_root()
-    api_url = (
-        os.getenv("API_URL", "").strip()
-        or os.getenv("PADDLE_OCR_API_URL", "").strip()
-        or DEFAULT_API_URL
+    ak = (
+        os.getenv("VOLC_OCR_ACCESS_KEY", "").strip()
+        or os.getenv("VOLC_ACCESS_KEY", "").strip()
+        or os.getenv("VOLC_AK", "").strip()
     )
-    token = os.getenv("TOKEN", "").strip() or os.getenv("PADDLE_OCR_TOKEN", "").strip()
-    if not token:
-        raise ValueError("missing OCR token; set TOKEN in .env")
-    return api_url, token
+    sk = (
+        os.getenv("VOLC_OCR_SECRET_KEY", "").strip()
+        or os.getenv("VOLC_SECRET_KEY", "").strip()
+        or os.getenv("VOLC_SK", "").strip()
+    )
+    if not ak or not sk:
+        raise ValueError("missing volc AK/SK; set VOLC_ACCESS_KEY and VOLC_SECRET_KEY in .env")
+    session_token = (
+        os.getenv("VOLC_OCR_SESSION_TOKEN", "").strip() or os.getenv("VOLC_SESSION_TOKEN", "").strip() or None
+    )
+    host = os.getenv("VOLC_OCR_HOST", "").strip() or DEFAULT_VOLC_OCR_HOST
+    return ak, sk, session_token, host
 
 
 def _resolve_http_timeouts() -> Tuple[float, float]:
-    # Keep OCR request responsive by default; all values are overrideable via .env.
-    connect_raw = os.getenv("PADDLE_OCR_CONNECT_TIMEOUT_SEC", "").strip()
-    read_raw = os.getenv("PADDLE_OCR_READ_TIMEOUT_SEC", "").strip()
+    # Prefer new VOLC_OCR_* knobs and keep old PADDLE_* as fallback for compatibility.
+    connect_raw = (
+        os.getenv("VOLC_OCR_CONNECT_TIMEOUT_SEC", "").strip()
+        or os.getenv("PADDLE_OCR_CONNECT_TIMEOUT_SEC", "").strip()
+    )
+    read_raw = (
+        os.getenv("VOLC_OCR_READ_TIMEOUT_SEC", "").strip()
+        or os.getenv("PADDLE_OCR_READ_TIMEOUT_SEC", "").strip()
+    )
     try:
         connect_timeout = float(connect_raw) if connect_raw else 8.0
     except Exception:
         connect_timeout = 8.0
     try:
-        read_timeout = float(read_raw) if read_raw else 30.0
+        read_timeout = float(read_raw) if read_raw else 60.0
     except Exception:
-        read_timeout = 30.0
+        read_timeout = 60.0
     connect_timeout = max(1.0, connect_timeout)
     read_timeout = max(1.0, read_timeout)
     return connect_timeout, read_timeout
@@ -125,6 +159,17 @@ def _quad_from_bbox(x1: float, y1: float, x2: float, y2: float) -> List[List[flo
         [float(x2), float(y2)],
         [float(x1), float(y2)],
     ]
+
+
+def _extract_bbox_coords(payload: Mapping[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    # Support both x0/y0/x1/y1 and left/top/right/bottom naming.
+    left = payload.get("x0", payload.get("left"))
+    top = payload.get("y0", payload.get("top"))
+    right = payload.get("x1", payload.get("right"))
+    bottom = payload.get("y1", payload.get("bottom"))
+    if all(isinstance(v, (int, float)) for v in (left, top, right, bottom)):
+        return float(left), float(top), float(right), float(bottom)
+    return None
 
 
 def _parse_quad_value(location_val: Any, item: Mapping[str, Any]) -> List[List[float]]:
@@ -153,12 +198,9 @@ def _parse_quad_value(location_val: Any, item: Mapping[str, Any]) -> List[List[f
         if len(points) == 4:
             return points
 
-        x1 = location_val.get("x1", location_val.get("left"))
-        y1 = location_val.get("y1", location_val.get("top"))
-        x2 = location_val.get("x2", location_val.get("right"))
-        y2 = location_val.get("y2", location_val.get("bottom"))
-        if all(isinstance(v, (int, float)) for v in (x1, y1, x2, y2)):
-            return _quad_from_bbox(float(x1), float(y1), float(x2), float(y2))
+        bbox = _extract_bbox_coords(location_val)
+        if bbox is not None:
+            return _quad_from_bbox(*bbox)
 
         x = location_val.get("x")
         y = location_val.get("y")
@@ -202,12 +244,9 @@ def _parse_quad(item: Mapping[str, Any], required: bool) -> List[List[float]]:
             location_val = item[key]
             break
     if location_val is None:
-        x1 = item.get("x1", item.get("left"))
-        y1 = item.get("y1", item.get("top"))
-        x2 = item.get("x2", item.get("right"))
-        y2 = item.get("y2", item.get("bottom"))
-        if all(isinstance(v, (int, float)) for v in (x1, y1, x2, y2)):
-            return _quad_from_bbox(float(x1), float(y1), float(x2), float(y2))
+        bbox = _extract_bbox_coords(item)
+        if bbox is not None:
+            return _quad_from_bbox(*bbox)
         if required:
             raise ValueError(f"missing Location in OCR output item: {item}")
         return []
@@ -239,10 +278,18 @@ def _extract_text_value(item: Mapping[str, Any]) -> Optional[str]:
 
 
 def _extract_confidence(item: Mapping[str, Any]) -> Optional[float]:
-    for key in ("Confidence", "confidence", "Score", "score", "Probability", "probability"):
+    for key in ("Confidence", "confidence", "Score", "score", "Probability", "probability", "prob"):
         val = item.get(key)
         if isinstance(val, (int, float)):
             return float(val)
+        if isinstance(val, str):
+            s = val.strip()
+            if not s:
+                continue
+            try:
+                return float(s)
+            except Exception:
+                continue
     return None
 
 
@@ -265,6 +312,8 @@ def _find_general_items(raw_output: Mapping[str, Any]) -> List[Mapping[str, Any]
         "items",
         "lines",
         "ocrtexts",
+        "textblocks",
+        "ocr_infos",
     }
 
     for node in _iter_dict_nodes(raw_output):
@@ -418,6 +467,17 @@ def parse_ai_process_response(resp: Mapping[str, Any]) -> Tuple[Dict[str, Any], 
         parsed_output = parse_result_output_value(raw_output)
         return parsed_output, request_id
 
+    # Volc OCRPdf response format.
+    if "data" in resp and isinstance(resp.get("data"), Mapping):
+        data = dict(resp.get("data", {}))
+        detail = data.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            try:
+                data["detail"] = json.loads(detail)
+            except Exception:
+                pass
+        return data, request_id
+
     # Paddle layout-parsing response format.
     paddle_result = resp.get("result")
     if isinstance(paddle_result, list):
@@ -427,32 +487,105 @@ def parse_ai_process_response(resp: Mapping[str, Any]) -> Tuple[Dict[str, Any], 
     raise ValueError(f"missing result in paddle OCR response: {resp}")
 
 
-def _ocr_ai_process_bytes_internal(
+def _new_visual_service() -> VisualService:
+    ak, sk, session_token, host = _resolve_volc_credentials()
+    connect_timeout, read_timeout = _resolve_http_timeouts()
+    service = VisualService()
+    service.set_ak(ak)
+    service.set_sk(sk)
+    if session_token:
+        service.set_session_token(session_token)
+    service.set_host(host)
+    service.set_connection_timeout(int(max(1, round(connect_timeout))))
+    service.set_socket_timeout(int(max(1, round(read_timeout))))
+    return service
+
+
+def _ocr_pdf_base_form(file_type_name: str) -> Dict[str, Any]:
+    form: Dict[str, Any] = {
+        "version": os.getenv("VOLC_OCR_VERSION", "v3").strip() or "v3",
+        "file_type": file_type_name,
+        "parse_mode": os.getenv("VOLC_OCR_PARSE_MODE", "auto").strip() or "auto",
+        "table_mode": os.getenv("VOLC_OCR_TABLE_MODE", "markdown").strip() or "markdown",
+        "filter_header": os.getenv("VOLC_OCR_FILTER_HEADER", "true").strip() or "true",
+    }
+    if file_type_name == "pdf":
+        page_start_raw = os.getenv("VOLC_OCR_PAGE_START", "").strip()
+        page_num_raw = os.getenv("VOLC_OCR_PAGE_NUM", "").strip()
+        try:
+            form["page_start"] = int(page_start_raw) if page_start_raw else 0
+        except Exception:
+            form["page_start"] = 0
+        try:
+            form["page_num"] = int(page_num_raw) if page_num_raw else 16
+        except Exception:
+            form["page_num"] = 16
+    return form
+
+
+def _ocr_multilang_base_form() -> Dict[str, Any]:
+    mode = (os.getenv("VOLC_OCR_MULTILANG_MODE", "default").strip() or "default").lower()
+    if mode not in {"default", "text_block"}:
+        mode = "default"
+    filter_thresh = os.getenv("VOLC_OCR_MULTILANG_FILTER_THRESH", "80").strip() or "80"
+    approximate_pixel = os.getenv("VOLC_OCR_MULTILANG_APPROXIMATE_PIXEL", "0").strip() or "0"
+    return {
+        "mode": mode,
+        "filter_thresh": str(filter_thresh),
+        "approximate_pixel": str(approximate_pixel),
+    }
+
+
+def _filter_multilang_ocr_infos(parsed_output: Mapping[str, Any], lang_mode: Optional[str]) -> Dict[str, Any]:
+    lang = _validate_lang_mode(lang_mode)
+    out = dict(parsed_output)
+    infos = out.get("ocr_infos")
+    if not isinstance(infos, list):
+        return out
+    if lang is None:
+        return out
+    # Keep target language plus common mixed-script lines.
+    allowed = {lang, "not_lang", "en"}
+    filtered: List[Mapping[str, Any]] = []
+    for it in infos:
+        if not isinstance(it, Mapping):
+            continue
+        line_lang = str(it.get("lang", "")).strip().lower()
+        if not line_lang or line_lang in allowed:
+            filtered.append(dict(it))
+    out["ocr_infos"] = filtered
+    return out
+
+
+def _validate_base64_budget(file_bytes: bytes) -> None:
+    b64 = base64.b64encode(file_bytes).decode("ascii")
+    encoded_len = len(quote_plus(b64))
+    max_len_raw = os.getenv("VOLC_OCR_MAX_URLENCODED_BASE64_BYTES", "").strip()
+    try:
+        max_len = int(max_len_raw) if max_len_raw else 8 * 1024 * 1024
+    except Exception:
+        max_len = 8 * 1024 * 1024
+    if encoded_len > max_len:
+        raise ValueError(
+            "OCRPdf image_base64 payload exceeds limit after urlencode: "
+            f"{encoded_len} > {max_len}. Use smaller image, split PDF, or use image_url(TOS)."
+        )
+
+
+def _ocr_with_form(
     *,
-    file_bytes: bytes,
-    file_type: int,
     scene: str,
     max_retries: int,
-    api_url: str,
-    token: str,
+    form: Dict[str, Any],
     data_type_label: str,
+    ocr_endpoint: str = "pdf",
+    lang_mode: Optional[str] = None,
 ) -> OCRResult:
     sc = _validate_scene(scene)
+    endpoint = _validate_ocr_endpoint(ocr_endpoint)
+    lang = _validate_lang_mode(lang_mode)
     retries = validate_max_retries(max_retries)
-    if int(file_type) not in {0, 1}:
-        raise ValueError(f"file_type must be 0(pdf) or 1(image), got: {file_type}")
-    if not file_bytes:
-        raise ValueError("OCR input is empty")
-
-    payload = {
-        "file": base64.b64encode(file_bytes).decode("ascii"),
-        "fileType": int(file_type),
-        "useDocOrientationClassify": False,
-        "useDocUnwarping": False,
-        "useChartRecognition": False,
-    }
-    headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
-    connect_timeout, read_timeout = _resolve_http_timeouts()
+    service = _new_visual_service()
     begin = time.perf_counter()
     last_exc: Optional[BaseException] = None
 
@@ -461,22 +594,19 @@ def _ocr_ai_process_bytes_internal(
         request_id: Optional[str] = None
         parsed_output: Optional[Dict[str, Any]] = None
         try:
-            http_resp = requests.post(
-                api_url,
-                json=payload,
-                headers=headers,
-                timeout=(connect_timeout, read_timeout),
-            )
-            if http_resp.status_code != 200:
-                raise PaddleHTTPError(http_resp.status_code, http_resp.text)
-            resp = http_resp.json()
+            if endpoint == "pdf":
+                resp = service.ocr_pdf(form)
+            else:
+                # Some SDK versions don't include this action in the built-in api map.
+                service.set_api_info("MultiLanguageOCR", "2022-08-31")
+                resp = service.ocr_api("MultiLanguageOCR", form)
+            if isinstance(resp, Mapping):
+                code = resp.get("code")
+                if code not in (None, 10000, "10000"):
+                    raise VolcOCRBusinessError(code=code, message=str(resp.get("message", "") or resp.get("msg", "")))
             parsed_output, request_id = parse_ai_process_response(resp)
-            request_id = (
-                request_id
-                or http_resp.headers.get("x-request-id")
-                or http_resp.headers.get("X-Request-Id")
-                or http_resp.headers.get("x-bce-request-id")
-            )
+            if endpoint == "multilang":
+                parsed_output = _filter_multilang_ocr_infos(parsed_output, lang)
             if sc == "general":
                 texts = _parse_general_output(parsed_output)
                 fields = {}
@@ -560,16 +690,28 @@ def ocr_ai_process_bytes(
     scene: str = "general",
     file_type: int = 1,
     max_retries: int = 4,
+    ocr_endpoint: str = "pdf",
+    lang_mode: Optional[str] = None,
 ) -> OCRResult:
-    api_url, token = _resolve_paddle_config()
-    return _ocr_ai_process_bytes_internal(
-        file_bytes=file_bytes,
-        file_type=int(file_type),
+    ftype = int(file_type)
+    if ftype not in {0, 1}:
+        raise ValueError(f"file_type must be 0(pdf) or 1(image), got: {file_type}")
+    if not file_bytes:
+        raise ValueError("OCR input is empty")
+    _validate_base64_budget(file_bytes)
+    endpoint = _validate_ocr_endpoint(ocr_endpoint)
+    if endpoint == "pdf":
+        form = _ocr_pdf_base_form("pdf" if ftype == 0 else "image")
+    else:
+        form = _ocr_multilang_base_form()
+    form["image_base64"] = base64.b64encode(file_bytes).decode("ascii")
+    return _ocr_with_form(
         scene=scene,
         max_retries=max_retries,
-        api_url=api_url,
-        token=token,
+        form=form,
         data_type_label="bytes",
+        ocr_endpoint=endpoint,
+        lang_mode=lang_mode,
     )
 
 
@@ -580,63 +722,69 @@ def ocr_ai_process(
     scene: str = "general",
     model_id: str = "default",
     max_retries: int = 4,
+    ocr_endpoint: str = "pdf",
+    lang_mode: Optional[str] = None,
 ) -> OCRResult:
     _ = service_id
     _ = model_id
     dt = _validate_data_type(data_type)
     obj_or_url = _validate_object_key_or_url(object_key_or_url, dt)
-    connect_timeout, read_timeout = _resolve_http_timeouts()
-
-    file_bytes: bytes
-    file_type = 1
+    use_url = False
+    url_value = ""
+    file_bytes: bytes | None = None
+    file_type_name = "image"
     if dt == "file":
         local_path = Path(obj_or_url).expanduser()
         if not local_path.exists() or not local_path.is_file():
             raise ValueError(f"local file not found: {obj_or_url}")
         file_bytes = local_path.read_bytes()
         if local_path.suffix.lower() == ".pdf":
-            file_type = 0
+            file_type_name = "pdf"
     elif dt == "url":
-        parsed = urlparse(obj_or_url)
-        if parsed.path.lower().endswith(".pdf"):
-            file_type = 0
-        dl_resp = requests.get(obj_or_url, timeout=(connect_timeout, read_timeout))
-        if dl_resp.status_code != 200:
-            raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
-        file_bytes = dl_resp.content
+        use_url = True
+        url_value = obj_or_url
+        if urlparse(obj_or_url).path.lower().endswith(".pdf"):
+            file_type_name = "pdf"
     else:  # dt == "uri"
         possible_local = Path(obj_or_url).expanduser()
         if possible_local.exists() and possible_local.is_file():
             file_bytes = possible_local.read_bytes()
             if possible_local.suffix.lower() == ".pdf":
-                file_type = 0
+                file_type_name = "pdf"
         elif obj_or_url.startswith(("http://", "https://")):
-            parsed = urlparse(obj_or_url)
-            if parsed.path.lower().endswith(".pdf"):
-                file_type = 0
-            dl_resp = requests.get(obj_or_url, timeout=(connect_timeout, read_timeout))
-            if dl_resp.status_code != 200:
-                raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
-            file_bytes = dl_resp.content
+            use_url = True
+            url_value = obj_or_url
+            if urlparse(obj_or_url).path.lower().endswith(".pdf"):
+                file_type_name = "pdf"
         else:
             public_domain = os.getenv("VOLC_OCR_PUBLIC_DOMAIN", "").strip()
             if not public_domain:
                 raise ValueError(
                     "data_type=uri requires a local path/url or VOLC_OCR_PUBLIC_DOMAIN to convert object key into URL"
                 )
-            url = f"https://{public_domain.strip('/')}/{obj_or_url.lstrip('/')}"
-            dl_resp = requests.get(url, timeout=(connect_timeout, read_timeout))
-            if dl_resp.status_code != 200:
-                raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
-            file_bytes = dl_resp.content
+            use_url = True
+            url_value = f"https://{public_domain.strip('/')}/{obj_or_url.lstrip('/')}"
+            if urlparse(url_value).path.lower().endswith(".pdf"):
+                file_type_name = "pdf"
 
-    api_url, token = _resolve_paddle_config()
-    return _ocr_ai_process_bytes_internal(
-        file_bytes=file_bytes,
-        file_type=file_type,
+    endpoint = _validate_ocr_endpoint(ocr_endpoint)
+    if endpoint == "pdf":
+        form = _ocr_pdf_base_form(file_type_name)
+    else:
+        form = _ocr_multilang_base_form()
+    if use_url:
+        form["image_url"] = url_value
+    else:
+        if file_bytes is None:
+            raise ValueError("OCR input is empty")
+        _validate_base64_budget(file_bytes)
+        form["image_base64"] = base64.b64encode(file_bytes).decode("ascii")
+
+    return _ocr_with_form(
         scene=scene,
         max_retries=max_retries,
-        api_url=api_url,
-        token=token,
+        form=form,
         data_type_label=dt,
+        ocr_endpoint=endpoint,
+        lang_mode=lang_mode,
     )

@@ -40,6 +40,8 @@ class StoryboardPaths:
 @dataclass
 class StoryboardOptions:
     strict_ocr: bool = True
+    ocr_mode: str = "pdf"  # "pdf" | "multilang"
+    ocr_lang: str = "zh"  # "zh" | "ko"
     reuse_preprocess_cache: bool = True
     force_reprocess: bool = False
     split_mode: str = "bands"  # "bands" | "stage2"
@@ -157,6 +159,8 @@ def _load_preprocess_cache(
     image_path: Path,
     prefix: str,
     enable_mask_inpaint: bool,
+    ocr_mode: str,
+    ocr_lang: str,
 ) -> Tuple[np.ndarray, List[Dict], Dict] | None:
     if not cache_path.exists():
         return None
@@ -168,7 +172,11 @@ def _load_preprocess_cache(
     if payload.get("source_signature", {}) != _file_signature(image_path):
         return None
 
-    expected_cfg = {"enable_mask_inpaint": bool(enable_mask_inpaint)}
+    expected_cfg = {
+        "enable_mask_inpaint": bool(enable_mask_inpaint),
+        "ocr_mode": str(ocr_mode),
+        "ocr_lang": str(ocr_lang),
+    }
     if payload.get("config_signature", {}) != expected_cfg:
         return None
 
@@ -199,10 +207,16 @@ def _save_preprocess_cache(
     image_path: Path,
     preprocess_meta: Dict,
     enable_mask_inpaint: bool,
+    ocr_mode: str,
+    ocr_lang: str,
 ) -> None:
     payload = {
         "source_signature": _file_signature(image_path),
-        "config_signature": {"enable_mask_inpaint": bool(enable_mask_inpaint)},
+        "config_signature": {
+            "enable_mask_inpaint": bool(enable_mask_inpaint),
+            "ocr_mode": str(ocr_mode),
+            "ocr_lang": str(ocr_lang),
+        },
         "preprocess_meta": preprocess_meta,
         "created_at": int(time.time()),
     }
@@ -297,6 +311,8 @@ class PreprocessAgent(WorkflowAgent):
                 image_path=paths.image_path,
                 prefix=paths.prefix,
                 enable_mask_inpaint=opts.enable_mask_inpaint,
+                ocr_mode=str(opts.ocr_mode),
+                ocr_lang=str(opts.ocr_lang),
             )
             if cached is not None:
                 ctx.state.seg_bgr, ctx.state.texts_payload, ctx.state.preprocess_meta = cached
@@ -313,6 +329,8 @@ class PreprocessAgent(WorkflowAgent):
                     out_dir=paths.out_dir,
                     prefix=paths.prefix,
                     enable_mask_inpaint=bool(opts.enable_mask_inpaint),
+                    ocr_mode=str(opts.ocr_mode),
+                    ocr_lang=str(opts.ocr_lang),
                     progress_hook=lambda msg: ctx.log(f"preprocess: {msg}"),
                 ),
                 log=ctx.log,
@@ -348,6 +366,8 @@ class PreprocessAgent(WorkflowAgent):
                 "ocr_status": pp.ocr_status,
                 "ocr_request_id": pp.ocr_request_id,
                 "ocr_degraded_reason": pp.ocr_degraded_reason,
+                "ocr_mode": str(opts.ocr_mode),
+                "ocr_lang": str(opts.ocr_lang),
                 "upload_latency_ms": pp.upload_latency_ms,
                 "ocr_latency_ms": pp.ocr_latency_ms,
                 "ocr_input_size": pp.ocr_input_size,
@@ -362,6 +382,8 @@ class PreprocessAgent(WorkflowAgent):
                     image_path=paths.image_path,
                     preprocess_meta=ctx.state.preprocess_meta,
                     enable_mask_inpaint=opts.enable_mask_inpaint,
+                    ocr_mode=str(opts.ocr_mode),
+                    ocr_lang=str(opts.ocr_lang),
                 )
                 ctx.log(f"preprocess cache saved: {cache_path}")
         else:
@@ -585,6 +607,8 @@ class TextPackagingAgent(WorkflowAgent):
             "ocr_latency_ms": ctx.state.preprocess_meta.get("ocr_latency_ms", 0),
             "ocr_input_size": ctx.state.preprocess_meta.get("ocr_input_size", {}),
             "ocr_gray_input_path": ctx.state.preprocess_meta.get("ocr_gray_input_path", ""),
+            "ocr_mode": ctx.state.preprocess_meta.get("ocr_mode", ""),
+            "ocr_lang": ctx.state.preprocess_meta.get("ocr_lang", ""),
             "ocr_degraded_reason": ctx.state.preprocess_meta.get("ocr_degraded_reason", ""),
             "merge_unmatched_psd_count": ctx.state.preprocess_meta.get("merge_unmatched_psd_count", 0),
             "merge_unmatched_ocr_count": ctx.state.preprocess_meta.get("merge_unmatched_ocr_count", 0),
@@ -630,6 +654,7 @@ class StoryboardWorkflow:
         self.ctx.log(f"out_dir={self.ctx.paths.out_dir}")
         self.ctx.log(f"debug_dir={self.ctx.paths.debug_dir}")
         self.ctx.log(f"strict_ocr={self.ctx.options.strict_ocr}")
+        self.ctx.log(f"ocr_mode={self.ctx.options.ocr_mode}, ocr_lang={self.ctx.options.ocr_lang}")
         self.ctx.log(f"split_mode={self.ctx.options.split_mode}")
         self.ctx.log(
             "reuse_preprocess_cache=%s, force_reprocess=%s"

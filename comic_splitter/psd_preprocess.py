@@ -7,7 +7,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -99,18 +99,6 @@ class OcrExtractResult:
     degraded_reason: str = ""
 
 
-@dataclass
-class WhiteComponent:
-    bbox: List[int]
-    area_ratio: float
-    solidity: float
-    hole_ratio: float
-    quality: float
-    mask: np.ndarray
-    x0: int
-    y0: int
-
-
 def _load_dotenv_from_repo_root() -> None:
     try:
         from dotenv import load_dotenv
@@ -135,6 +123,15 @@ def _clamp_bbox(bbox: Tuple[int, int, int, int], width: int, height: int) -> Tup
 def _bbox_area(bbox: List[int]) -> float:
     x1, y1, x2, y2 = [float(v) for v in bbox]
     return float(max(0.0, x2 - x1) * max(0.0, y2 - y1))
+
+
+def _bboxes_intersect(
+    a: Tuple[int, int, int, int] | List[int],
+    b: Tuple[int, int, int, int] | List[int],
+) -> bool:
+    ax1, ay1, ax2, ay2 = [int(v) for v in a]
+    bx1, by1, bx2, by2 = [int(v) for v in b]
+    return max(ax1, bx1) < min(ax2, bx2) and max(ay1, by1) < min(ay2, by2)
 
 
 def _bbox_from_quad(quad: List[List[float]]) -> List[int]:
@@ -186,17 +183,6 @@ def _layer_path(layer: Layer) -> str:
             break
         cur = parent
     return "/".join(reversed(parts))
-
-
-def _iter_ancestor_groups(layer: Layer) -> Iterable[Layer]:
-    cur = layer
-    while hasattr(cur, "parent") and cur.parent is not None:
-        parent = cur.parent
-        if isinstance(parent, PSDImage):
-            return
-        if getattr(parent, "kind", "") == "group":
-            yield parent
-        cur = parent
 
 
 def _build_runtime_layer_maps(psd: PSDImage) -> Tuple[Dict[int, int], Dict[int, Layer], Dict[int, str]]:
@@ -372,11 +358,24 @@ def prepare_ocr_input_image_png(
     )
 
 
+def _is_ocr_payload_limit_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    keywords = (
+        "payload exceeds limit after urlencode",
+        "image size exceeds maximum limit",
+        "http status=413",
+        "413 request entity too large",
+    )
+    return any(k in msg for k in keywords)
+
+
 def _extract_ocr_texts_from_source(
     source_bgr: np.ndarray,
     width: int,
     height: int,
     gray_png_export_path: Optional[Path] = None,
+    ocr_mode: str = "pdf",
+    ocr_lang: str = "zh",
     progress_hook: Optional[Callable[[str], None]] = None,
 ) -> OcrExtractResult:
     def _log(msg: str) -> None:
@@ -396,7 +395,14 @@ def _extract_ocr_texts_from_source(
             degraded_reason="VOLC_OCR_ENABLE is disabled",
         )
 
-    _log("ocr: encode input image (grayscale original png)")
+    mode = str(ocr_mode or "").strip().lower() or str(os.getenv("VOLC_OCR_API_MODE", "pdf")).strip().lower()
+    if mode not in {"pdf", "multilang"}:
+        mode = "pdf"
+    lang = str(ocr_lang or "").strip().lower() or str(os.getenv("VOLC_OCR_LANG", "zh")).strip().lower()
+    if lang not in {"zh", "ko"}:
+        lang = "zh"
+
+    _log(f"ocr: encode input image (grayscale original png), mode={mode}, lang={lang}")
     try:
         if source_bgr.ndim == 2:
             gray = source_bgr
@@ -405,19 +411,23 @@ def _extract_ocr_texts_from_source(
         else:
             raise ValueError(f"unsupported OCR source image shape: {source_bgr.shape}")
 
+        request_gray_base = gray
+        if mode == "multilang":
+            request_gray_base = _resize_for_ocr_limits(gray, max_long=2048, max_short=2048)
+
         png_comp_raw = str(os.getenv("OCR_GRAY_PNG_COMPRESSION", "6")).strip()
         try:
             png_comp = int(png_comp_raw)
         except Exception:
             png_comp = 6
         png_comp = int(np.clip(png_comp, 0, 9))
-        ok, encoded = cv2.imencode(".png", gray, [int(cv2.IMWRITE_PNG_COMPRESSION), png_comp])
+        ok, encoded = cv2.imencode(".png", request_gray_base, [int(cv2.IMWRITE_PNG_COMPRESSION), png_comp])
         if not ok:
             raise ValueError("failed to encode OCR original grayscale PNG input")
         original_bytes = encoded.tobytes()
         original_meta = {
-            "width": int(gray.shape[1]),
-            "height": int(gray.shape[0]),
+            "width": int(request_gray_base.shape[1]),
+            "height": int(request_gray_base.shape[0]),
             "jpeg_bytes": int(len(original_bytes)),
             "quality": 100,
             "png_compression": int(png_comp),
@@ -426,7 +436,7 @@ def _extract_ocr_texts_from_source(
         if gray_png_export_path is not None:
             try:
                 gray_png_export_path.parent.mkdir(parents=True, exist_ok=True)
-                if cv2.imwrite(str(gray_png_export_path), gray):
+                if cv2.imwrite(str(gray_png_export_path), request_gray_base):
                     gray_image_path = str(gray_png_export_path)
                     _log(f"ocr: gray input saved -> {gray_image_path}")
                 else:
@@ -466,21 +476,72 @@ def _extract_ocr_texts_from_source(
         except Exception:
             ocr_max_retries = 2
         request_meta = dict(original_meta)
+        request_bytes = original_bytes
+        request_gray = gray
         _log(
-            "ocr: request start (grayscale original png, size=%dx%d, bytes=%d, png_comp=%d)"
+            "ocr: request start (mode=%s, lang=%s, grayscale original png, size=%dx%d, bytes=%d, png_comp=%d)"
             % (
+                mode,
+                lang,
                 int(request_meta.get("width", 0)),
                 int(request_meta.get("height", 0)),
                 int(request_meta.get("jpeg_bytes", 0)),
                 int(request_meta.get("png_compression", -1)),
             )
         )
-        ocr_result = ocr_ai_process_bytes(
-            file_bytes=original_bytes,
-            scene="general",
-            file_type=1,
-            max_retries=ocr_max_retries,
-        )
+        try:
+            ocr_result = ocr_ai_process_bytes(
+                file_bytes=request_bytes,
+                scene="general",
+                file_type=1,
+                max_retries=ocr_max_retries,
+                ocr_endpoint=mode,
+                lang_mode=lang,
+            )
+        except Exception as first_exc:
+            if not _is_ocr_payload_limit_error(first_exc):
+                raise
+            _log("ocr: original gray png exceeds OCRPdf size limit, fallback to compressed grayscale png")
+            max_bytes_raw = str(os.getenv("OCR_GRAY_PNG_MAX_BYTES", str(5 * 1024 * 1024))).strip()
+            try:
+                fallback_max_bytes = max(256 * 1024, int(max_bytes_raw))
+            except Exception:
+                fallback_max_bytes = 5 * 1024 * 1024
+            request_bytes, request_meta, request_gray = prepare_ocr_input_image_png(
+                request_gray_base,
+                max_bytes=fallback_max_bytes,
+                compression_seq=(3, 6, 9),
+                resize_scale_seq=(1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5),
+            )
+            if gray_png_export_path is not None:
+                try:
+                    original_path = gray_png_export_path.with_name(f"{gray_png_export_path.stem}_original.png")
+                    if cv2.imwrite(str(original_path), request_gray_base):
+                        _log(f"ocr: original gray saved -> {original_path}")
+                    if cv2.imwrite(str(gray_png_export_path), request_gray):
+                        gray_image_path = str(gray_png_export_path)
+                        _log(f"ocr: fallback gray input saved -> {gray_image_path}")
+                except Exception as save_exc:
+                    _log(f"ocr: failed to save fallback gray input: {save_exc}")
+            _log(
+                "ocr: fallback request start (mode=%s, lang=%s, size=%dx%d, bytes=%d, png_comp=%d)"
+                % (
+                    mode,
+                    lang,
+                    int(request_meta.get("width", 0)),
+                    int(request_meta.get("height", 0)),
+                    int(request_meta.get("jpeg_bytes", 0)),
+                    int(request_meta.get("png_compression", -1)),
+                )
+            )
+            ocr_result = ocr_ai_process_bytes(
+                file_bytes=request_bytes,
+                scene="general",
+                file_type=1,
+                max_retries=ocr_max_retries,
+                ocr_endpoint=mode,
+                lang_mode=lang,
+            )
         _log(f"ocr: response done ({ocr_result.elapsed_ms}ms), texts={len(ocr_result.texts)}")
 
         texts: List[TextItem] = []
@@ -521,9 +582,10 @@ def _extract_ocr_texts_from_source(
             degraded_reason="",
         )
     except Exception as exc:
+        fail_status = "failed_input_limit" if _is_ocr_payload_limit_error(exc) else "degraded"
         return OcrExtractResult(
             texts=[],
-            status="degraded",
+            status=fail_status,
             request_id=None,
             upload_latency_ms=0,
             ocr_latency_ms=0,
@@ -762,401 +824,131 @@ def _layer_rgba_and_bbox(
     return rgba_u8, bbox
 
 
-def _component_metrics(comp_mask: np.ndarray) -> Tuple[float, float]:
-    area = float(np.count_nonzero(comp_mask))
-    if area <= 1.0:
-        return 0.0, 1.0
-
-    contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0, 1.0
-    cnt = max(contours, key=cv2.contourArea)
-    hull = cv2.convexHull(cnt)
-    hull_area = float(max(cv2.contourArea(hull), 1.0))
-    solidity = float(area / hull_area)
-
-    closed = cv2.morphologyEx(comp_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-    hole_pixels = max(0.0, float(np.count_nonzero(closed)) - area)
-    hole_ratio = float(hole_pixels / max(area, 1.0))
-    return solidity, hole_ratio
-
-
-def _component_quality(solidity: float, hole_ratio: float, flatness: float = 0.5) -> float:
-    solidity_score = float(np.clip((solidity - 0.35) / 0.55, 0.0, 1.0))
-    hole_score = 1.0 - float(np.clip(abs(hole_ratio - 0.15) / 0.45, 0.0, 1.0))
-    flatness_score = float(np.clip(flatness, 0.0, 1.0))
-    return float(np.clip(0.45 * solidity_score + 0.25 * hole_score + 0.30 * flatness_score, 0.0, 1.0))
-
-
-def _extract_white_components_from_rgba(
-    rgba: np.ndarray,
-    bbox: Tuple[int, int, int, int],
-    canvas_area: int,
-    white_v_thr: int,
-    white_s_thr: int,
-    alpha_thr: int,
-    min_area_ratio: float = 0.001,
-    max_area_ratio: float = 0.5,
-) -> List[WhiteComponent]:
-    _ = white_v_thr
-    _ = white_s_thr
-    rgb = rgba[:, :, :3]
-    alpha = rgba[:, :, 3]
-    mask = (alpha > alpha_thr).astype(np.uint8) * 255
-    if mask.size == 0:
-        return []
-
-    # Color-agnostic component extraction from rendered layer alpha.
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    kernel_mid = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_small, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_mid, iterations=1)
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    x0, y0, _, _ = bbox
-    out: List[WhiteComponent] = []
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-    for cid in range(1, n):
-        x, y, w, h, area = [int(v) for v in stats[cid]]
-        if area <= 0 or w <= 1 or h <= 1:
-            continue
-        ratio = float(area / max(canvas_area, 1))
-        if ratio < min_area_ratio or ratio > max_area_ratio:
-            continue
-
-        comp_mask = ((labels[y : y + h, x : x + w] == cid).astype(np.uint8) * 255)
-        solidity, hole_ratio = _component_metrics(comp_mask)
-        if solidity < 0.25 or hole_ratio > 0.85:
-            continue
-
-        # Flatness helps keep dialog/textbox layers while remaining color-agnostic.
-        roi_gray = gray[y : y + h, x : x + w]
-        vals = roi_gray[comp_mask > 0]
-        if vals.size > 16:
-            std = float(np.std(vals))
-            flatness = float(np.clip(1.0 - (std / 80.0), 0.0, 1.0))
-        else:
-            flatness = 0.0
-        quality = _component_quality(solidity, hole_ratio, flatness)
-
-        out.append(
-            WhiteComponent(
-                bbox=[x0 + x, y0 + y, x0 + x + w, y0 + y + h],
-                area_ratio=ratio,
-                solidity=solidity,
-                hole_ratio=hole_ratio,
-                quality=quality,
-                mask=comp_mask,
-                x0=x0 + x,
-                y0=y0 + y,
-            )
-        )
-    return out
-
-
-def _intersection_ratio(text_bbox: List[int], comp_bbox: List[int]) -> float:
-    tx1, ty1, tx2, ty2 = [int(v) for v in text_bbox]
-    cx1, cy1, cx2, cy2 = [int(v) for v in comp_bbox]
-    ix1 = max(tx1, cx1)
-    iy1 = max(ty1, cy1)
-    ix2 = min(tx2, cx2)
-    iy2 = min(ty2, cy2)
-    inter = float(max(0, ix2 - ix1) * max(0, iy2 - iy1))
-    t_area = max(1.0, _bbox_area(text_bbox))
-    return float(inter / t_area)
-
-
-def _point_in_component(px: int, py: int, comp: WhiteComponent) -> bool:
-    if px < comp.x0 or py < comp.y0:
-        return False
-    h, w = comp.mask.shape[:2]
-    lx = px - comp.x0
-    ly = py - comp.y0
-    if lx < 0 or ly < 0 or lx >= w or ly >= h:
-        return False
-    return bool(comp.mask[ly, lx] > 0)
-
-
-def _bbox_intersects(a: List[int], b: List[int]) -> bool:
-    ax1, ay1, ax2, ay2 = [int(v) for v in a]
-    bx1, by1, bx2, by2 = [int(v) for v in b]
-    return max(ax1, bx1) < min(ax2, bx2) and max(ay1, by1) < min(ay2, by2)
-
-
-def _build_text_focus_boxes(texts: List[TextItem], width: int, height: int) -> List[List[int]]:
-    boxes: List[List[int]] = []
-    for t in texts:
-        x1, y1, x2, y2 = [int(v) for v in t.bbox]
-        tw = max(1, x2 - x1)
-        th = max(1, y2 - y1)
-        pad_x = int(np.clip(0.8 * tw + 16, 12, 140))
-        pad_y = int(np.clip(1.2 * th + 20, 16, 220))
-        ex1 = int(np.clip(x1 - pad_x, 0, width))
-        ey1 = int(np.clip(y1 - pad_y, 0, height))
-        ex2 = int(np.clip(x2 + pad_x, 0, width))
-        ey2 = int(np.clip(y2 + pad_y, 0, height))
-        if ex2 > ex1 and ey2 > ey1:
-            boxes.append([ex1, ey1, ex2, ey2])
-    return boxes
-
-
-def _build_text_proximity_mask(texts: List[TextItem], width: int, height: int) -> np.ndarray:
+def _build_text_union_mask(texts: List[TextItem], width: int, height: int) -> np.ndarray:
     mask = np.zeros((height, width), dtype=np.uint8)
     for t in texts:
+        quad = t.quad if (t.quad and len(t.quad) == 4) else _quad_from_bbox(t.bbox)
+        try:
+            pts = np.array([[int(round(p[0])), int(round(p[1]))] for p in quad], dtype=np.int32)
+        except Exception:
+            pts = np.empty((0, 2), dtype=np.int32)
+        if pts.shape == (4, 2):
+            cv2.fillPoly(mask, [pts], 255)
+            continue
         x1, y1, x2, y2 = [int(v) for v in t.bbox]
-        tw = max(1, x2 - x1)
-        th = max(1, y2 - y1)
-        pad_x = int(np.clip(0.6 * tw + 8, 8, 80))
-        pad_y = int(np.clip(0.9 * th + 8, 8, 120))
-        ex1 = int(np.clip(x1 - pad_x, 0, width))
-        ey1 = int(np.clip(y1 - pad_y, 0, height))
-        ex2 = int(np.clip(x2 + pad_x, 0, width))
-        ey2 = int(np.clip(y2 + pad_y, 0, height))
-        if ex2 > ex1 and ey2 > ey1:
-            mask[ey1:ey2, ex1:ex2] = 255
+        x1 = int(np.clip(x1, 0, width))
+        x2 = int(np.clip(x2, 0, width))
+        y1 = int(np.clip(y1, 0, height))
+        y2 = int(np.clip(y2, 0, height))
+        if x2 > x1 and y2 > y1:
+            mask[y1:y2, x1:x2] = 255
     return mask
 
 
-def _component_text_proximity(comp: WhiteComponent, text_mask: np.ndarray | None) -> float:
-    if text_mask is None:
-        return 0.0
-    h, w = comp.mask.shape[:2]
-    y1, y2 = int(comp.y0), int(comp.y0 + h)
-    x1, x2 = int(comp.x0), int(comp.x0 + w)
-    if y1 < 0 or x1 < 0 or y2 > text_mask.shape[0] or x2 > text_mask.shape[1]:
-        return 0.0
-    local = text_mask[y1:y2, x1:x2]
-    comp_bin = comp.mask > 0
-    area = float(np.count_nonzero(comp_bin))
-    if area <= 0:
-        return 0.0
-    hit = float(np.count_nonzero(comp_bin & (local > 0)))
-    return float(np.clip(hit / area, 0.0, 1.0))
-
-
-def _score_layer_components(
-    components: List[WhiteComponent],
-    texts: List[TextItem],
-    text_mask: np.ndarray | None = None,
-) -> Tuple[float, float, float, float, float]:
-    if not components:
-        return 0.0, 0.0, 0.0, 0.0, 0.0
-    white_quality = float(np.mean([c.quality for c in components]))
-    comp_areas = [max(1.0, float(np.count_nonzero(c.mask > 0))) for c in components]
-    comp_prox = [_component_text_proximity(c, text_mask) for c in components]
-    area_sum = max(1.0, float(sum(comp_areas)))
-    text_proximity_ratio = float(sum(a * p for a, p in zip(comp_areas, comp_prox)) / area_sum)
-
-    if not texts:
-        score = float(np.clip(0.2 * white_quality, 0.0, 1.0))
-        return 0.0, 0.0, white_quality, score, 0.0
-
-    overlap_hits = 0
-    center_hits = 0
-    matched_hits = 0
-    overlap_sum = 0.0
-    for t in texts:
-        tx1, ty1, tx2, ty2 = [int(v) for v in t.bbox]
-        cx = int(round((tx1 + tx2) * 0.5))
-        cy = int(round((ty1 + ty2) * 0.5))
-
-        max_overlap = 0.0
-        center_hit = False
-        for comp in components:
-            ov = _intersection_ratio(t.bbox, comp.bbox)
-            if ov > max_overlap:
-                max_overlap = ov
-            if _point_in_component(cx, cy, comp):
-                center_hit = True
-            if center_hit and ov >= 0.08:
-                # Component surrounds text center and intersects text bbox.
-                tx_area = max(1.0, _bbox_area(t.bbox))
-                comp_area = max(1.0, _bbox_area(comp.bbox))
-                area_ratio = float(np.clip(comp_area / tx_area, 1.0, 60.0))
-                enclosure = float(np.clip(1.0 - abs(np.log(area_ratio / 6.0)) / 2.0, 0.0, 1.0))
-                if 0.45 * float(center_hit) + 0.35 * float(np.clip(max_overlap / 0.5, 0.0, 1.0)) + 0.20 * enclosure >= 0.40:
-                    matched_hits += 1
-                    break
-
-        if max_overlap >= 0.2:
-            overlap_hits += 1
-        if center_hit:
-            center_hits += 1
-        overlap_sum += max_overlap
-
-    n = float(max(len(texts), 1))
-    text_overlap = float(overlap_hits / n)
-    center_hit_ratio = float(center_hits / n)
-    text_match_ratio = float(matched_hits / n)
-    overlap_mean = float(overlap_sum / n)
-    score = float(
-        np.clip(
-            0.42 * text_match_ratio
-            + 0.22 * center_hit_ratio
-            + 0.13 * text_overlap
-            + 0.10 * white_quality
-            + 0.13 * text_proximity_ratio,
-            0.0,
-            1.0,
-        )
-    )
-    return text_overlap, center_hit_ratio, white_quality, score, overlap_mean
-
-
-def _collect_text_stats_for_layer(
-    layer_box: List[int],
-    texts: List[TextItem],
-) -> Tuple[int, int, float, float, float]:
-    overlap_count = 0
-    center_hits = 0
-    iou_max = 0.0
-
-    lx1, ly1, lx2, ly2 = [int(v) for v in layer_box]
-    for t in texts:
-        tb = t.bbox
-        if _bbox_intersects(layer_box, tb):
-            overlap_count += 1
-        iou_max = max(iou_max, _bbox_iou(layer_box, tb))
-
-        tx1, ty1, tx2, ty2 = [int(v) for v in tb]
-        cx = int(round((tx1 + tx2) * 0.5))
-        cy = int(round((ty1 + ty2) * 0.5))
-        if lx1 <= cx < lx2 and ly1 <= cy < ly2:
-            center_hits += 1
-
-    n_total = float(max(len(texts), 1))
-    overlap_ratio = float(overlap_count / n_total)
-    center_ratio = float(center_hits / n_total)
-    return overlap_count, center_hits, iou_max, overlap_ratio, center_ratio
-
-
-def _collect_anchor_group_ids(
-    psd: PSDImage,
-    layer_ids: List[int],
-    layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
-    runtime_id_by_obj: Optional[Dict[int, int]] = None,
-) -> set[int]:
-    if not layer_ids:
-        return set()
-    if layer_by_runtime_id is None:
-        layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
-    out: set[int] = set()
-    for lid in layer_ids:
-        layer = layer_by_runtime_id.get(int(lid))
-        if layer is None:
-            continue
-        for g in _iter_ancestor_groups(layer):
-            gid = int(getattr(g, "layer_id", -1))
-            if runtime_id_by_obj is not None:
-                gid = int(runtime_id_by_obj.get(id(g), gid))
-            out.add(gid)
-    return out
-
-
-def _detect_raster_text_layers(
-    psd: PSDImage,
-    texts: List[TextItem],
+def _layer_union_overlap_stats(
+    layer: Layer,
+    text_union_mask: np.ndarray,
+    width: int,
+    height: int,
     alpha_thr: int = 10,
+    prefer_composite: bool = False,
+) -> Tuple[int, int, float]:
+    rgba, real_bbox = _layer_rgba_and_bbox(layer, width, height, prefer_composite=prefer_composite)
+    if rgba is None:
+        return 0, 0, 0.0
+    alpha_bin = rgba[:, :, 3] > int(alpha_thr)
+    layer_pixels = int(np.count_nonzero(alpha_bin))
+    if layer_pixels <= 0:
+        return 0, 0, 0.0
+
+    lx1, ly1, lx2, ly2 = [int(v) for v in real_bbox]
+    local_union = text_union_mask[ly1:ly2, lx1:lx2] > 0
+    if local_union.shape != alpha_bin.shape:
+        hh = min(local_union.shape[0], alpha_bin.shape[0])
+        ww = min(local_union.shape[1], alpha_bin.shape[1])
+        if hh <= 0 or ww <= 0:
+            return layer_pixels, 0, 0.0
+        local_union = local_union[:hh, :ww]
+        alpha_local = alpha_bin[:hh, :ww]
+    else:
+        alpha_local = alpha_bin
+
+    overlap_pixels = int(np.count_nonzero(alpha_local & local_union))
+    overlap_ratio = float(np.clip(overlap_pixels / max(float(layer_pixels), 1.0), 0.0, 1.0))
+    return layer_pixels, overlap_pixels, overlap_ratio
+
+
+def _detect_raster_text_layers_by_union(
+    psd: PSDImage,
+    text_union_mask: np.ndarray,
+    in_union_ratio_thr: float = 0.85,
+    alpha_thr: int = 10,
+    min_pixels: int = 20,
     runtime_id_by_obj: Optional[Dict[int, int]] = None,
+    exclude_layer_ids: Optional[set[int]] = None,
 ) -> List[int]:
-    if not texts:
+    if text_union_mask.size == 0 or int(np.count_nonzero(text_union_mask)) <= 0:
         return []
 
     width, height = [int(v) for v in psd.size]
-    canvas_area = max(1.0, float(width * height))
-    text_mask = _build_text_proximity_mask(texts=texts, width=width, height=height)
+    union_points = cv2.findNonZero((text_union_mask > 0).astype(np.uint8))
+    if union_points is None:
+        return []
+    ux, uy, uw, uh = cv2.boundingRect(union_points)
+    text_union_bbox = (
+        int(ux),
+        int(uy),
+        int(ux + uw),
+        int(uy + uh),
+    )
 
+    excluded = set(exclude_layer_ids or set())
     scored: List[Tuple[float, int]] = []
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
         if runtime_id_by_obj is not None:
             lid = int(runtime_id_by_obj.get(id(layer), lid))
+        if lid in excluded:
+            continue
         if not bool(getattr(layer, "visible", True)):
             continue
         if str(getattr(layer, "kind", "")) == "group":
             continue
-
-        bbox = _clamp_bbox(layer.bbox, width, height)
-        if bbox == (0, 0, 0, 0):
+        layer_bbox = _clamp_bbox(tuple(int(v) for v in layer.bbox), width, height)
+        if layer_bbox == (0, 0, 0, 0):
             continue
-        layer_box = [bbox[0], bbox[1], bbox[2], bbox[3]]
-        bbox_area_ratio = float(_bbox_area(layer_box) / canvas_area)
-        if bbox_area_ratio > 0.08:
+        if not _bboxes_intersect(layer_bbox, text_union_bbox):
             continue
-
-        overlap_count, center_hits, iou_max, _, _ = _collect_text_stats_for_layer(layer_box, texts)
-        if center_hits < 2 and overlap_count < 3:
+        layer_pixels, _, overlap_ratio = _layer_union_overlap_stats(
+            layer=layer,
+            text_union_mask=text_union_mask,
+            width=width,
+            height=height,
+            alpha_thr=alpha_thr,
+            prefer_composite=False,
+        )
+        if layer_pixels < int(min_pixels):
             continue
-
-        rgba, real_bbox = _layer_rgba_and_bbox(layer, width, height, prefer_composite=False)
-        if rgba is None:
-            continue
-
-        alpha_bin = rgba[:, :, 3] > int(alpha_thr)
-        nz = int(np.count_nonzero(alpha_bin))
-        if nz <= 20:
-            continue
-
-        alpha_area_ratio = float(nz / canvas_area)
-        if alpha_area_ratio > 0.015:
-            continue
-
-        local_area = max(1.0, float(alpha_bin.shape[0] * alpha_bin.shape[1]))
-        fill_ratio = float(nz / local_area)
-        if fill_ratio < 0.05 or fill_ratio > 0.60:
-            continue
-
-        lx1, ly1, lx2, ly2 = [int(v) for v in real_bbox]
-        local_text_mask = text_mask[ly1:ly2, lx1:lx2] > 0
-        if local_text_mask.shape != alpha_bin.shape:
-            hh = min(local_text_mask.shape[0], alpha_bin.shape[0])
-            ww = min(local_text_mask.shape[1], alpha_bin.shape[1])
-            if hh <= 0 or ww <= 0:
-                continue
-            local_text_mask = local_text_mask[:hh, :ww]
-            alpha_local = alpha_bin[:hh, :ww]
-        else:
-            alpha_local = alpha_bin
-
-        text_hit_ratio = float(np.count_nonzero(alpha_local & local_text_mask) / max(float(np.count_nonzero(alpha_local)), 1.0))
-        if text_hit_ratio < 0.82:
-            continue
-
-        iou_score = float(np.clip(iou_max / 0.20, 0.0, 1.0))
-        center_score = float(np.clip(center_hits / 4.0, 0.0, 1.0))
-        fill_score = float(np.clip(1.0 - abs(fill_ratio - 0.26) / 0.26, 0.0, 1.0))
-        score = float(np.clip(0.45 * text_hit_ratio + 0.25 * iou_score + 0.20 * center_score + 0.10 * fill_score, 0.0, 1.0))
-
-        if score >= 0.72 or (text_hit_ratio >= 0.95 and iou_max >= 0.12):
-            scored.append((score, lid))
-
+        if overlap_ratio >= float(in_union_ratio_thr):
+            scored.append((overlap_ratio, lid))
     scored.sort(key=lambda x: x[0], reverse=True)
     return [int(lid) for _, lid in scored]
 
 
-def rank_bubble_layers(
+def rank_bubble_layers_by_text_union(
     psd: PSDImage,
-    texts: List[TextItem],
-    min_component_area_ratio: float = 0.001,
-    white_v_thr: int = 230,
-    white_s_thr: int = 50,
+    text_union_mask: np.ndarray,
+    overlap_ratio_thr: float = 0.35,
     alpha_thr: int = 10,
+    min_pixels: int = 20,
     exclude_layer_ids: Optional[set[int]] = None,
-    text_anchor_group_ids: Optional[set[int]] = None,
     runtime_id_by_obj: Optional[Dict[int, int]] = None,
 ) -> Tuple[List[BubbleLayerScore], Dict[int, str]]:
-    _ = white_v_thr
-    _ = white_s_thr
-
     width, height = [int(v) for v in psd.size]
     canvas_area = max(1.0, float(width * height))
-
+    excluded = set(exclude_layer_ids or set())
     ranking: List[BubbleLayerScore] = []
     layer_path_by_id: Dict[int, str] = {}
-
-    text_layer_ids = {int(t.layer_id) for t in texts if int(t.layer_id) >= 0}
-    excluded = set(exclude_layer_ids or set()) | text_layer_ids
-    text_mask = _build_text_proximity_mask(texts=texts, width=width, height=height) if texts else None
 
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
@@ -1165,129 +957,42 @@ def rank_bubble_layers(
         kind = str(getattr(layer, "kind", ""))
         layer_path_by_id[lid] = _layer_path(layer)
 
-        if not bool(getattr(layer, "visible", True)):
-            continue
-        if kind == "group":
-            continue
         if lid in excluded:
             continue
-
-        bbox = _clamp_bbox(layer.bbox, width, height)
-        if bbox == (0, 0, 0, 0):
-            continue
-        layer_box = [bbox[0], bbox[1], bbox[2], bbox[3]]
-
-        bbox_area = _bbox_area(layer_box)
-        if bbox_area <= 0:
-            continue
-        bbox_area_ratio = float(bbox_area / canvas_area)
-        if bbox_area_ratio > 0.75:
+        if not bool(getattr(layer, "visible", True)):
             continue
 
-        overlap_count, center_hits, iou_max, overlap_ratio, center_ratio = _collect_text_stats_for_layer(layer_box, texts)
-        if overlap_count <= 0 and center_hits <= 0:
-            continue
-        if center_hits < 6 and overlap_ratio < 0.18:
-            continue
-        if bbox_area_ratio > 0.35 and center_ratio < 0.30:
-            continue
-
-        anc_ids = set()
-        for g in _iter_ancestor_groups(layer):
-            gid = int(getattr(g, "layer_id", -1))
-            if runtime_id_by_obj is not None:
-                gid = int(runtime_id_by_obj.get(id(g), gid))
-            anc_ids.add(gid)
-        if text_anchor_group_ids and (not (anc_ids & text_anchor_group_ids)) and center_hits < 12:
-            continue
-
-        rgba, real_bbox = _layer_rgba_and_bbox(layer, width, height, prefer_composite=False)
-        if rgba is None:
-            continue
-
-        alpha_bin = rgba[:, :, 3] > int(alpha_thr)
-        nz = int(np.count_nonzero(alpha_bin))
-        if nz < 40:
-            continue
-
-        bubble_area_ratio = float(nz / canvas_area)
-        if bubble_area_ratio < max(0.003, float(min_component_area_ratio) * 0.8):
-            continue
-        if bubble_area_ratio > 0.62:
-            continue
-
-        local_area = max(1.0, float(alpha_bin.shape[0] * alpha_bin.shape[1]))
-        fill_ratio = float(nz / local_area)
-        if fill_ratio < 0.03:
-            continue
-
-        text_proximity_ratio = 0.0
-        if text_mask is not None:
-            lx1, ly1, lx2, ly2 = [int(v) for v in real_bbox]
-            local_text_mask = text_mask[ly1:ly2, lx1:lx2] > 0
-            if local_text_mask.shape != alpha_bin.shape:
-                hh = min(local_text_mask.shape[0], alpha_bin.shape[0])
-                ww = min(local_text_mask.shape[1], alpha_bin.shape[1])
-                if hh <= 0 or ww <= 0:
-                    continue
-                local_text_mask = local_text_mask[:hh, :ww]
-                alpha_local = alpha_bin[:hh, :ww]
-            else:
-                alpha_local = alpha_bin
-            text_hit = float(np.count_nonzero(alpha_local & local_text_mask))
-            text_proximity_ratio = float(np.clip(text_hit / max(float(np.count_nonzero(alpha_local)), 1.0), 0.0, 1.0))
-
-        if text_proximity_ratio < 0.10 and center_hits < 6:
-            continue
-
-        gray = cv2.cvtColor(rgba[:, :, :3], cv2.COLOR_RGB2GRAY)
-        vals = gray[alpha_bin]
-        if vals.size > 16:
-            std = float(np.std(vals))
-            flatness = float(np.clip(1.0 - (std / 90.0), 0.0, 1.0))
-        else:
-            flatness = 0.0
-
-        fill_score = float(np.clip(1.0 - abs(fill_ratio - 0.32) / 0.32, 0.0, 1.0))
-        overlap_score = float(np.clip(overlap_ratio / 0.40, 0.0, 1.0))
-        center_score = float(np.clip(center_ratio / 0.40, 0.0, 1.0))
-        area_penalty = float(np.clip((bubble_area_ratio - 0.40) / 0.20, 0.0, 1.0))
-
-        group_bonus = 0.16 if (text_anchor_group_ids and (anc_ids & text_anchor_group_ids)) else 0.0
-
-        score = float(
-            np.clip(
-                0.34 * text_proximity_ratio
-                + 0.24 * center_score
-                + 0.16 * overlap_score
-                + 0.14 * fill_score
-                + 0.12 * flatness
-                + group_bonus
-                - 0.22 * area_penalty,
-                0.0,
-                1.0,
-            )
+        layer_pixels, overlap_pixels, overlap_ratio = _layer_union_overlap_stats(
+            layer=layer,
+            text_union_mask=text_union_mask,
+            width=width,
+            height=height,
+            alpha_thr=alpha_thr,
+            # Group may carry multi-layer dialog bubble content.
+            prefer_composite=(kind == "group"),
         )
-        if score < 0.18:
+        if layer_pixels < int(min_pixels):
+            continue
+        if overlap_ratio < float(overlap_ratio_thr):
             continue
 
-        comp_count = 1
+        bubble_area_ratio = float(layer_pixels / canvas_area)
         ranking.append(
             BubbleLayerScore(
                 layer_id=lid,
                 layer_path=layer_path_by_id[lid],
                 kind=kind or "pixel",
-                component_count=comp_count,
+                component_count=1,
                 bubble_area_ratio=bubble_area_ratio,
                 r_bubble=overlap_ratio,
-                r_text=center_ratio,
-                score=score,
-                solidity=fill_ratio,
-                hole_ratio=float(np.clip(1.0 - fill_ratio, 0.0, 1.0)),
+                r_text=overlap_ratio,
+                score=overlap_ratio,
+                solidity=float(np.clip(overlap_pixels / max(float(layer_pixels), 1.0), 0.0, 1.0)),
+                hole_ratio=0.0,
                 text_overlap=overlap_ratio,
-                center_hit_ratio=center_ratio,
-                white_component_quality=flatness,
-                text_proximity_ratio=text_proximity_ratio,
+                center_hit_ratio=0.0,
+                white_component_quality=0.0,
+                text_proximity_ratio=overlap_ratio,
             )
         )
 
@@ -1295,8 +1000,6 @@ def rank_bubble_layers(
         key=lambda x: (
             x.score,
             x.text_proximity_ratio,
-            x.center_hit_ratio,
-            x.text_overlap,
             -x.bubble_area_ratio,
         ),
         reverse=True,
@@ -1304,200 +1007,11 @@ def rank_bubble_layers(
     return ranking, layer_path_by_id
 
 
-def _build_ancestor_map(psd: PSDImage, runtime_id_by_obj: Optional[Dict[int, int]] = None) -> Dict[int, set[int]]:
-    ancestors: Dict[int, set[int]] = {}
-    for layer in psd.descendants():
-        lid = int(getattr(layer, "layer_id", -1))
-        if runtime_id_by_obj is not None:
-            lid = int(runtime_id_by_obj.get(id(layer), lid))
-        cur = layer
-        anc: set[int] = set()
-        while hasattr(cur, "parent") and cur.parent is not None:
-            parent = cur.parent
-            if isinstance(parent, PSDImage):
-                break
-            pid = int(getattr(parent, "layer_id", -1))
-            if runtime_id_by_obj is not None:
-                pid = int(runtime_id_by_obj.get(id(parent), pid))
-            anc.add(pid)
-            cur = parent
-        ancestors[lid] = anc
-    return ancestors
-
-
-def _select_textbox_layers(
-    psd: PSDImage,
-    ranking: List[BubbleLayerScore],
-    threshold: float = 0.42,
-    runtime_id_by_obj: Optional[Dict[int, int]] = None,
-) -> List[int]:
-    ancestors = _build_ancestor_map(psd, runtime_id_by_obj=runtime_id_by_obj)
-    selected: List[int] = []
-
-    candidates: List[Tuple[float, BubbleLayerScore]] = []
-    score_floor = max(0.18, float(threshold) - 0.20)
-
-    for item in ranking:
-        if item.bubble_area_ratio < 0.006:
-            continue
-        if item.bubble_area_ratio > 0.62:
-            continue
-        if item.score < score_floor:
-            continue
-        if item.text_proximity_ratio < 0.20 and not (
-            item.text_proximity_ratio >= 0.14 and item.center_hit_ratio >= 0.45 and item.score >= 0.70
-        ):
-            continue
-        if item.center_hit_ratio < 0.04:
-            continue
-        if item.bubble_area_ratio > 0.45 and item.center_hit_ratio < 0.10:
-            continue
-
-        priority = float(
-            0.62 * item.score
-            + 0.18 * item.text_proximity_ratio
-            + 0.10 * item.center_hit_ratio
-            + 0.06 * item.text_overlap
-            + 0.04 * item.white_component_quality
-            - 0.10 * item.bubble_area_ratio
-        )
-        if priority < 0.22:
-            continue
-        candidates.append((priority, item))
-
-    candidates.sort(key=lambda x: x[0], reverse=True)
-
-    for _, item in candidates:
-        lid = int(item.layer_id)
-        conflict = False
-        for sid in selected:
-            anc_l = ancestors.get(lid, set())
-            anc_s = ancestors.get(sid, set())
-            if sid in anc_l or lid in anc_s:
-                conflict = True
-                break
-        if conflict:
-            continue
-        selected.append(lid)
-        if len(selected) >= 16:
-            break
-
-    return selected
-
-
-def _mask_from_text_quads(image_shape: Tuple[int, int], texts: List[TextItem]) -> np.ndarray:
-    h, w = image_shape
-    mask = np.zeros((h, w), dtype=np.uint8)
-    for t in texts:
-        if t.layer_id >= 0:
-            continue
-
-        quad = t.quad if t.quad else _quad_from_bbox(t.bbox)
-        pts = np.array([[int(round(p[0])), int(round(p[1]))] for p in quad], dtype=np.int32)
-        if pts.shape == (4, 2):
-            cv2.fillPoly(mask, [pts], 255)
-
-        x1, y1, x2, y2 = [int(v) for v in t.bbox]
-        tw = max(1, x2 - x1)
-        th = max(1, y2 - y1)
-        pad_x = int(np.clip(0.14 * tw + 2, 2, 10))
-        pad_y = int(np.clip(0.20 * th + 2, 2, 14))
-        ex1 = int(np.clip(x1 - pad_x, 0, w))
-        ey1 = int(np.clip(y1 - pad_y, 0, h))
-        ex2 = int(np.clip(x2 + pad_x, 0, w))
-        ey2 = int(np.clip(y2 + pad_y, 0, h))
-        if ex2 > ex1 and ey2 > ey1:
-            cv2.rectangle(mask, (ex1, ey1), (ex2, ey2), 255, thickness=-1)
-
-    if np.count_nonzero(mask) > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
-    return mask
-
-
-def _inpaint_mask_components(image_bgr: np.ndarray, mask: np.ndarray, radius: int = 3) -> np.ndarray:
-    if np.count_nonzero(mask) == 0:
-        return image_bgr
-
-    out = image_bgr.copy()
-    bin_mask = (mask > 0).astype(np.uint8)
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(bin_mask, connectivity=8)
-    if n <= 1:
-        return cv2.inpaint(out, (bin_mask * 255).astype(np.uint8), radius, cv2.INPAINT_TELEA)
-
-    pad = max(4, int(radius) * 3)
-    h, w = out.shape[:2]
-    for cid in range(1, n):
-        x, y, ww, hh, area = [int(v) for v in stats[cid]]
-        if area <= 0 or ww <= 0 or hh <= 0:
-            continue
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(w, x + ww + pad)
-        y2 = min(h, y + hh + pad)
-        roi = out[y1:y2, x1:x2]
-        if roi.size == 0:
-            continue
-        roi_mask = ((labels[y1:y2, x1:x2] == cid).astype(np.uint8) * 255)
-        out[y1:y2, x1:x2] = cv2.inpaint(roi, roi_mask, radius, cv2.INPAINT_TELEA)
-    return out
-
-
-def _mask_from_removed_layers(
-    psd: PSDImage,
-    remove_layer_ids: List[int],
-    image_shape: Tuple[int, int],
-    alpha_thr: int = 10,
-    layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
-) -> np.ndarray:
-    h, w = image_shape
-    mask = np.zeros((h, w), dtype=np.uint8)
-    if not remove_layer_ids:
-        return mask
-
-    if layer_by_runtime_id is None:
-        layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
-    for lid in sorted(set(remove_layer_ids)):
-        layer = layer_by_runtime_id.get(int(lid))
-        if layer is None:
-            continue
-        if str(getattr(layer, "kind", "")) == "group":
-            continue
-
-        rgba, bbox = _layer_rgba_and_bbox(layer, w, h, prefer_composite=False)
-        if rgba is None:
-            continue
-        x1, y1, x2, y2 = [int(v) for v in bbox]
-        if x2 <= x1 or y2 <= y1:
-            continue
-
-        alpha_bin = (rgba[:, :, 3] > int(alpha_thr)).astype(np.uint8) * 255
-        hh = min(alpha_bin.shape[0], y2 - y1)
-        ww = min(alpha_bin.shape[1], x2 - x1)
-        if hh <= 0 or ww <= 0:
-            continue
-
-        cur = mask[y1 : y1 + hh, x1 : x1 + ww]
-        mask[y1 : y1 + hh, x1 : x1 + ww] = np.maximum(cur, alpha_bin[:hh, :ww])
-
-    if np.count_nonzero(mask) > 0:
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
-    return mask
-
-
 def build_clean_art(
     psd: PSDImage,
     remove_layer_ids: List[int],
-    enable_mask_inpaint: bool = False,
-    inpaint_texts: Optional[List[TextItem]] = None,
-    source_bgr: Optional[np.ndarray] = None,
     layer_by_runtime_id: Optional[Dict[int, Layer]] = None,
 ) -> np.ndarray:
-    _ = enable_mask_inpaint
-    _ = inpaint_texts
-    _ = source_bgr
-
     # Strict mode: remove/hide target layers, then composite. No inpaint.
     if layer_by_runtime_id is None:
         layer_by_runtime_id = {int(getattr(layer, "layer_id", -1)): layer for layer in psd.descendants()}
@@ -1551,23 +1065,16 @@ def preprocess_psd_for_panels(
     image_path: Path,
     out_dir: Path,
     prefix: str,
-    min_component_area_ratio: float = 0.001,
-    white_v_thr: int = 230,
-    white_s_thr: int = 50,
     alpha_thr: int = 10,
-    min_components: int = 2,
-    min_r_bubble: float = 0.30,
-    min_bubble_area_ratio: float = 0.02,
     enable_mask_inpaint: bool = False,
+    ocr_mode: str = "pdf",
+    ocr_lang: str = "zh",
     progress_hook: Optional[Callable[[str], None]] = None,
 ) -> PsdPreprocessResult:
     def _log(msg: str) -> None:
         if progress_hook is not None:
             progress_hook(msg)
 
-    _ = min_components
-    _ = min_r_bubble
-    _ = min_bubble_area_ratio
     _ = enable_mask_inpaint
 
     _log("open psd")
@@ -1588,6 +1095,8 @@ def preprocess_psd_for_panels(
         width=width,
         height=height,
         gray_png_export_path=ocr_gray_input_path,
+        ocr_mode=ocr_mode,
+        ocr_lang=ocr_lang,
         progress_hook=progress_hook,
     )
     _log(
@@ -1606,41 +1115,36 @@ def preprocess_psd_for_panels(
     )
 
     text_layer_ids = {int(t.layer_id) for t in psd_texts if int(t.layer_id) >= 0}
-    _log("detect raster text layers")
-    raster_text_layer_ids = _detect_raster_text_layers(
-        psd=psd,
-        texts=merged_texts,
-        alpha_thr=alpha_thr,
-        runtime_id_by_obj=runtime_id_by_obj,
-    )
-    anchor_group_ids = _collect_anchor_group_ids(
-        psd=psd,
-        layer_ids=raster_text_layer_ids,
-        layer_by_runtime_id=layer_by_runtime_id,
-        runtime_id_by_obj=runtime_id_by_obj,
-    )
-    _log(f"raster text layers done: count={len(raster_text_layer_ids)}")
+    text_union_mask = _build_text_union_mask(merged_texts, width=width, height=height)
+    text_union_pixels = int(np.count_nonzero(text_union_mask))
+    text_union_ratio = float(text_union_pixels / max(float(width * height), 1.0))
+    _log(f"text union built: pixels={text_union_pixels}, area_ratio={text_union_ratio:.4f}")
 
-    _log("rank bubble/textbox layers")
-    ranking, layer_path_by_id = rank_bubble_layers(
+    _log("detect raster text layers (union coverage)")
+    raster_text_layer_ids = _detect_raster_text_layers_by_union(
         psd=psd,
-        texts=merged_texts,
-        min_component_area_ratio=min_component_area_ratio,
-        white_v_thr=white_v_thr,
-        white_s_thr=white_s_thr,
+        text_union_mask=text_union_mask,
+        in_union_ratio_thr=0.85,
         alpha_thr=alpha_thr,
-        exclude_layer_ids=set(raster_text_layer_ids),
-        text_anchor_group_ids=anchor_group_ids,
+        min_pixels=20,
         runtime_id_by_obj=runtime_id_by_obj,
+        exclude_layer_ids=set(text_layer_ids),
     )
-    _log(f"layer ranking done: candidates={len(ranking)}")
+    _log(f"raster text layers done (>=85% in text union): count={len(raster_text_layer_ids)}")
 
-    textbox_layer_ids = _select_textbox_layers(
+    _log("rank textbox layers (union overlap)")
+    ranking, layer_path_by_id = rank_bubble_layers_by_text_union(
         psd=psd,
-        ranking=ranking,
-        threshold=0.30,
+        text_union_mask=text_union_mask,
+        overlap_ratio_thr=0.35,
+        alpha_thr=alpha_thr,
+        min_pixels=20,
+        exclude_layer_ids=set(text_layer_ids) | set(raster_text_layer_ids),
         runtime_id_by_obj=runtime_id_by_obj,
     )
+    _log(f"textbox ranking done (>=35% overlap): candidates={len(ranking)}")
+
+    textbox_layer_ids = [int(r.layer_id) for r in ranking]
     bubble_layer_id: int | None = int(textbox_layer_ids[0]) if textbox_layer_ids else None
     bubble_layer_path: str | None = (
         layer_path_by_runtime_id.get(bubble_layer_id, layer_path_by_id.get(bubble_layer_id, None))
