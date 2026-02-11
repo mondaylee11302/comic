@@ -267,8 +267,10 @@ def create_react_workbench_app(
         logs: List[str] = []
 
         def _log(msg: str) -> None:
+            line = str(msg)
             if payload.verbose:
-                logs.append(str(msg))
+                logs.append(line)
+            print(f"[storyboard] {line}", flush=True)
 
         image_path = _norm_path(payload.image_path)
         if not image_path.exists():
@@ -298,10 +300,20 @@ def create_react_workbench_app(
         workflow = StoryboardWorkflow(
             paths=paths,
             options=options,
-            log=_log if payload.verbose else (lambda _msg: None),
+            log=_log,
             retry_matrix=AgentRetryMatrix(),
         )
-        state = workflow.run()
+        print(
+            f"[storyboard] start image={image_path} prefix={prefix} out_dir={out_dir} "
+            f"strict_ocr={bool(payload.strict_ocr)} split_mode={payload.split_mode}",
+            flush=True,
+        )
+        try:
+            state = workflow.run()
+        except Exception as exc:
+            # Return a readable API error instead of raw 500 traceback.
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        print(f"[storyboard] done prefix={prefix} text_count={len(state.texts_payload)}", flush=True)
 
         panels, _ = _load_panel_infos(out_dir, prefix)
         unified_preview = _load_unified_preview(out_dir, prefix)

@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from comic_splitter.psd_preprocess import prepare_ocr_input_image
+from comic_splitter.psd_preprocess import prepare_ocr_input_image, prepare_ocr_input_image_png
 
 
 class OCRImagePreprocessTests(unittest.TestCase):
@@ -24,6 +24,17 @@ class OCRImagePreprocessTests(unittest.TestCase):
         img = (np.random.rand(1200, 1800, 3) * 255).astype(np.uint8)
         with self.assertRaises(ValueError):
             prepare_ocr_input_image(img, max_bytes=3000)
+
+    def test_gray_png_budget_and_signature(self) -> None:
+        np.random.seed(3)
+        gray = (np.random.rand(3000, 5000) * 255).astype(np.uint8)
+        data, meta, resized = prepare_ocr_input_image_png(gray)
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertLessEqual(int(meta["width"]), 3840)
+        self.assertLessEqual(min(int(meta["width"]), int(meta["height"])), 2160)
+        self.assertLessEqual(int(meta["jpeg_bytes"]), 10 * 1024 * 1024)
+        self.assertIn("png_compression", meta)
+        self.assertEqual(resized.shape[1], int(meta["width"]))
 
 
 if __name__ == "__main__":

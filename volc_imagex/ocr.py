@@ -101,6 +101,23 @@ def _resolve_paddle_config() -> Tuple[str, str]:
     return api_url, token
 
 
+def _resolve_http_timeouts() -> Tuple[float, float]:
+    # Keep OCR request responsive by default; all values are overrideable via .env.
+    connect_raw = os.getenv("PADDLE_OCR_CONNECT_TIMEOUT_SEC", "").strip()
+    read_raw = os.getenv("PADDLE_OCR_READ_TIMEOUT_SEC", "").strip()
+    try:
+        connect_timeout = float(connect_raw) if connect_raw else 8.0
+    except Exception:
+        connect_timeout = 8.0
+    try:
+        read_timeout = float(read_raw) if read_raw else 30.0
+    except Exception:
+        read_timeout = 30.0
+    connect_timeout = max(1.0, connect_timeout)
+    read_timeout = max(1.0, read_timeout)
+    return connect_timeout, read_timeout
+
+
 def _quad_from_bbox(x1: float, y1: float, x2: float, y2: float) -> List[List[float]]:
     return [
         [float(x1), float(y1)],
@@ -435,6 +452,7 @@ def _ocr_ai_process_bytes_internal(
         "useChartRecognition": False,
     }
     headers = {"Authorization": f"token {token}", "Content-Type": "application/json"}
+    connect_timeout, read_timeout = _resolve_http_timeouts()
     begin = time.perf_counter()
     last_exc: Optional[BaseException] = None
 
@@ -443,7 +461,12 @@ def _ocr_ai_process_bytes_internal(
         request_id: Optional[str] = None
         parsed_output: Optional[Dict[str, Any]] = None
         try:
-            http_resp = requests.post(api_url, json=payload, headers=headers, timeout=120)
+            http_resp = requests.post(
+                api_url,
+                json=payload,
+                headers=headers,
+                timeout=(connect_timeout, read_timeout),
+            )
             if http_resp.status_code != 200:
                 raise PaddleHTTPError(http_resp.status_code, http_resp.text)
             resp = http_resp.json()
@@ -562,6 +585,7 @@ def ocr_ai_process(
     _ = model_id
     dt = _validate_data_type(data_type)
     obj_or_url = _validate_object_key_or_url(object_key_or_url, dt)
+    connect_timeout, read_timeout = _resolve_http_timeouts()
 
     file_bytes: bytes
     file_type = 1
@@ -576,7 +600,7 @@ def ocr_ai_process(
         parsed = urlparse(obj_or_url)
         if parsed.path.lower().endswith(".pdf"):
             file_type = 0
-        dl_resp = requests.get(obj_or_url, timeout=60)
+        dl_resp = requests.get(obj_or_url, timeout=(connect_timeout, read_timeout))
         if dl_resp.status_code != 200:
             raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
         file_bytes = dl_resp.content
@@ -590,7 +614,7 @@ def ocr_ai_process(
             parsed = urlparse(obj_or_url)
             if parsed.path.lower().endswith(".pdf"):
                 file_type = 0
-            dl_resp = requests.get(obj_or_url, timeout=60)
+            dl_resp = requests.get(obj_or_url, timeout=(connect_timeout, read_timeout))
             if dl_resp.status_code != 200:
                 raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
             file_bytes = dl_resp.content
@@ -601,7 +625,7 @@ def ocr_ai_process(
                     "data_type=uri requires a local path/url or VOLC_OCR_PUBLIC_DOMAIN to convert object key into URL"
                 )
             url = f"https://{public_domain.strip('/')}/{obj_or_url.lstrip('/')}"
-            dl_resp = requests.get(url, timeout=60)
+            dl_resp = requests.get(url, timeout=(connect_timeout, read_timeout))
             if dl_resp.status_code != 200:
                 raise PaddleHTTPError(dl_resp.status_code, dl_resp.text)
             file_bytes = dl_resp.content

@@ -18,12 +18,26 @@ async function apiGet(url) {
   return await res.json();
 }
 
-async function apiPost(url, payload) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
+async function apiPost(url, payload, options = {}) {
+  const timeoutMs = Number(options.timeoutMs || 0);
+  const controller = new AbortController();
+  const timer = timeoutMs > 0 ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err && err.name === "AbortError") {
+      throw new Error(`请求超时（>${Math.round(timeoutMs / 1000)}s）`);
+    }
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(text || `HTTP ${res.status}`);
@@ -70,6 +84,7 @@ function WorkflowPage() {
   const [uploaded, setUploaded] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [running, setRunning] = useState(false);
+  const [runStartedAt, setRunStartedAt] = useState(null);
 
   const [outDir, setOutDir] = useState(DEFAULT_OUT_DIR);
   const [debugDir, setDebugDir] = useState(DEFAULT_DEBUG_DIR);
@@ -101,6 +116,15 @@ function WorkflowPage() {
   const [generating, setGenerating] = useState(false);
   const [generated, setGenerated] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
+
+  useEffect(() => {
+    if (!running || !runStartedAt) return;
+    const id = setInterval(() => {
+      const secs = Math.max(0, Math.floor((Date.now() - runStartedAt) / 1000));
+      setStatusText(`提取中... ${secs}s`);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [running, runStartedAt]);
 
   async function uploadPsd() {
     if (!selectedFile) {
@@ -158,6 +182,8 @@ function WorkflowPage() {
     }
     setErrorMsg("");
     setRunning(true);
+    setRunStartedAt(Date.now());
+    setStatusText("提取中... 0s");
     setGenerated(null);
     try {
       const payload = {
@@ -172,7 +198,7 @@ function WorkflowPage() {
         heartbeat_sec: Number(heartbeatSec),
         verbose,
       };
-      const data = await apiPost("/api/storyboard/run", payload);
+      const data = await apiPost("/api/storyboard/run", payload, { timeoutMs: 10 * 60 * 1000 });
       setStoryboard(data);
       setStatusText(`提取完成：共 ${data.panel_count} 个分镜，文本 ${data.text_count} 条。`);
       if (data.panels && data.panels.length > 0) {
@@ -182,6 +208,7 @@ function WorkflowPage() {
       setErrorMsg(`提取失败: ${err.message}`);
     } finally {
       setRunning(false);
+      setRunStartedAt(null);
     }
   }
 

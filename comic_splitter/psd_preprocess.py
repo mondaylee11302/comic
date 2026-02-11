@@ -81,6 +81,7 @@ class PsdPreprocessResult:
     upload_latency_ms: int = 0
     ocr_latency_ms: int = 0
     ocr_input_size: Dict[str, int] | None = None
+    ocr_gray_input_path: str = ""
     merge_unmatched_psd_count: int = 0
     merge_unmatched_ocr_count: int = 0
     ocr_degraded_reason: str = ""
@@ -94,6 +95,7 @@ class OcrExtractResult:
     upload_latency_ms: int
     ocr_latency_ms: int
     input_size: Dict[str, int]
+    gray_image_path: str = ""
     degraded_reason: str = ""
 
 
@@ -317,10 +319,64 @@ def prepare_ocr_input_image(
     )
 
 
+def prepare_ocr_input_image_png(
+    image_gray: np.ndarray,
+    max_bytes: int = 10 * 1024 * 1024,
+    compression_seq: Tuple[int, ...] = (3, 6, 9),
+    resize_scale_seq: Tuple[float, ...] = (1.0, 0.9, 0.8, 0.7, 0.6),
+) -> Tuple[bytes, Dict[str, int], np.ndarray]:
+    if image_gray.ndim != 2:
+        raise ValueError(f"prepare_ocr_input_image_png expects 2D grayscale image, got shape={image_gray.shape}")
+
+    base = _resize_for_ocr_limits(image_gray)
+    last_bytes: bytes | None = None
+    last_comp = int(compression_seq[-1]) if compression_seq else 9
+    last_scaled = base
+
+    for scale in resize_scale_seq:
+        s = float(scale)
+        if s <= 0:
+            continue
+        if s >= 0.9999:
+            scaled = base
+        else:
+            nw = max(1, int(round(base.shape[1] * s)))
+            nh = max(1, int(round(base.shape[0] * s)))
+            scaled = cv2.resize(base, (nw, nh), interpolation=cv2.INTER_AREA)
+        last_scaled = scaled
+
+        for comp in compression_seq:
+            c = int(np.clip(int(comp), 0, 9))
+            ok, encoded = cv2.imencode(".png", scaled, [int(cv2.IMWRITE_PNG_COMPRESSION), c])
+            if not ok:
+                continue
+            data = encoded.tobytes()
+            last_bytes = data
+            last_comp = c
+            if len(data) <= max_bytes:
+                meta = {
+                    "width": int(scaled.shape[1]),
+                    "height": int(scaled.shape[0]),
+                    # Keep legacy key name for downstream compatibility.
+                    "jpeg_bytes": int(len(data)),
+                    "quality": 100,
+                    "png_compression": int(c),
+                }
+                return data, meta, scaled
+
+    if last_bytes is None:
+        raise ValueError("failed to encode OCR PNG input")
+    raise ValueError(
+        "OCR PNG input exceeds byte budget, "
+        f"last_bytes={len(last_bytes)}, compression={last_comp}, size={last_scaled.shape[1]}x{last_scaled.shape[0]}"
+    )
+
+
 def _extract_ocr_texts_from_source(
     source_bgr: np.ndarray,
     width: int,
     height: int,
+    gray_png_export_path: Optional[Path] = None,
     progress_hook: Optional[Callable[[str], None]] = None,
 ) -> OcrExtractResult:
     def _log(msg: str) -> None:
@@ -340,18 +396,53 @@ def _extract_ocr_texts_from_source(
             degraded_reason="VOLC_OCR_ENABLE is disabled",
         )
 
-    _log("ocr: encode input image")
+    _log("ocr: encode input image (grayscale original png)")
     try:
-        jpeg_bytes, input_meta, _ = prepare_ocr_input_image(source_bgr)
-    except ValueError as exc:
+        if source_bgr.ndim == 2:
+            gray = source_bgr
+        elif source_bgr.ndim == 3 and source_bgr.shape[2] >= 3:
+            gray = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2GRAY)
+        else:
+            raise ValueError(f"unsupported OCR source image shape: {source_bgr.shape}")
+
+        png_comp_raw = str(os.getenv("OCR_GRAY_PNG_COMPRESSION", "6")).strip()
+        try:
+            png_comp = int(png_comp_raw)
+        except Exception:
+            png_comp = 6
+        png_comp = int(np.clip(png_comp, 0, 9))
+        ok, encoded = cv2.imencode(".png", gray, [int(cv2.IMWRITE_PNG_COMPRESSION), png_comp])
+        if not ok:
+            raise ValueError("failed to encode OCR original grayscale PNG input")
+        original_bytes = encoded.tobytes()
+        original_meta = {
+            "width": int(gray.shape[1]),
+            "height": int(gray.shape[0]),
+            "jpeg_bytes": int(len(original_bytes)),
+            "quality": 100,
+            "png_compression": int(png_comp),
+        }
+        gray_image_path = ""
+        if gray_png_export_path is not None:
+            try:
+                gray_png_export_path.parent.mkdir(parents=True, exist_ok=True)
+                if cv2.imwrite(str(gray_png_export_path), gray):
+                    gray_image_path = str(gray_png_export_path)
+                    _log(f"ocr: gray input saved -> {gray_image_path}")
+                else:
+                    _log(f"ocr: failed to save gray input -> {gray_png_export_path}")
+            except Exception as save_exc:
+                _log(f"ocr: failed to save gray input: {save_exc}")
+    except Exception as exc:
         return OcrExtractResult(
             texts=[],
-            status="failed_input_limit",
+            status="degraded",
             request_id=None,
             upload_latency_ms=0,
             ocr_latency_ms=0,
             input_size={"width": int(width), "height": int(height), "jpeg_bytes": 0, "quality": 0},
-            degraded_reason=str(exc),
+            gray_image_path="",
+            degraded_reason=f"encode grayscale input failed: {exc}",
         )
 
     try:
@@ -363,19 +454,29 @@ def _extract_ocr_texts_from_source(
             request_id=None,
             upload_latency_ms=0,
             ocr_latency_ms=0,
-            input_size=input_meta,
+            input_size=original_meta,
+            gray_image_path=gray_image_path,
             degraded_reason=f"volc_imagex import failed: {exc}",
         )
 
     try:
-        max_retries_raw = str(os.getenv("VOLC_OCR_MAX_RETRIES", "4")).strip()
+        max_retries_raw = str(os.getenv("VOLC_OCR_MAX_RETRIES", "2")).strip()
         try:
             ocr_max_retries = max(1, int(max_retries_raw))
         except Exception:
-            ocr_max_retries = 4
-        _log(f"ocr: request start (max_retries={ocr_max_retries})")
+            ocr_max_retries = 2
+        request_meta = dict(original_meta)
+        _log(
+            "ocr: request start (grayscale original png, size=%dx%d, bytes=%d, png_comp=%d)"
+            % (
+                int(request_meta.get("width", 0)),
+                int(request_meta.get("height", 0)),
+                int(request_meta.get("jpeg_bytes", 0)),
+                int(request_meta.get("png_compression", -1)),
+            )
+        )
         ocr_result = ocr_ai_process_bytes(
-            file_bytes=jpeg_bytes,
+            file_bytes=original_bytes,
             scene="general",
             file_type=1,
             max_retries=ocr_max_retries,
@@ -383,8 +484,8 @@ def _extract_ocr_texts_from_source(
         _log(f"ocr: response done ({ocr_result.elapsed_ms}ms), texts={len(ocr_result.texts)}")
 
         texts: List[TextItem] = []
-        src_w = max(1.0, float(input_meta.get("width", width)))
-        src_h = max(1.0, float(input_meta.get("height", height)))
+        src_w = max(1.0, float(request_meta.get("width", width)))
+        src_h = max(1.0, float(request_meta.get("height", height)))
         scale_x = float(width) / src_w
         scale_y = float(height) / src_h
 
@@ -415,7 +516,8 @@ def _extract_ocr_texts_from_source(
             request_id=ocr_result.request_id,
             upload_latency_ms=0,
             ocr_latency_ms=int(ocr_result.elapsed_ms),
-            input_size=input_meta,
+            input_size=request_meta,
+            gray_image_path=gray_image_path,
             degraded_reason="",
         )
     except Exception as exc:
@@ -425,7 +527,8 @@ def _extract_ocr_texts_from_source(
             request_id=None,
             upload_latency_ms=0,
             ocr_latency_ms=0,
-            input_size=input_meta,
+            input_size=original_meta,
+            gray_image_path=gray_image_path,
             degraded_reason=str(exc),
         )
 
@@ -1470,6 +1573,8 @@ def preprocess_psd_for_panels(
     _log("open psd")
     psd = PSDImage.open(image_path)
     width, height = [int(v) for v in psd.size]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ocr_gray_input_path = out_dir / f"{prefix}_ocr_gray_input.png"
     runtime_id_by_obj, layer_by_runtime_id, layer_path_by_runtime_id = _build_runtime_layer_maps(psd)
     _log(f"psd opened: size={width}x{height}")
 
@@ -1478,7 +1583,13 @@ def preprocess_psd_for_panels(
     _log("extract psd texts")
     psd_texts = extract_psd_texts(psd, width, height, runtime_id_by_obj=runtime_id_by_obj)
     _log(f"psd texts done: count={len(psd_texts)}")
-    ocr_result = _extract_ocr_texts_from_source(source_bgr, width=width, height=height, progress_hook=progress_hook)
+    ocr_result = _extract_ocr_texts_from_source(
+        source_bgr,
+        width=width,
+        height=height,
+        gray_png_export_path=ocr_gray_input_path,
+        progress_hook=progress_hook,
+    )
     _log(
         "ocr done: status=%s, texts=%d, upload_ms=%d, ocr_ms=%d"
         % (ocr_result.status, len(ocr_result.texts), int(ocr_result.upload_latency_ms), int(ocr_result.ocr_latency_ms))
@@ -1547,7 +1658,6 @@ def preprocess_psd_for_panels(
     )
     _log("clean art done")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     art_clean_path = out_dir / f"{prefix}_art_clean.png"
     texts_path = out_dir / f"{prefix}_texts.json"
     texts_merged_path = out_dir / f"{prefix}_texts_merged.json"
@@ -1611,6 +1721,7 @@ def preprocess_psd_for_panels(
         upload_latency_ms=int(ocr_result.upload_latency_ms),
         ocr_latency_ms=int(ocr_result.ocr_latency_ms),
         ocr_input_size=dict(ocr_result.input_size),
+        ocr_gray_input_path=str(ocr_result.gray_image_path or ""),
         merge_unmatched_psd_count=int(merge_stats.get("merge_unmatched_psd_count", 0)),
         merge_unmatched_ocr_count=int(merge_stats.get("merge_unmatched_ocr_count", 0)),
         ocr_degraded_reason=ocr_result.degraded_reason,
