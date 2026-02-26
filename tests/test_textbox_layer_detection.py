@@ -74,6 +74,36 @@ class TextboxLayerDetectionTests(unittest.TestCase):
         self.assertEqual(int(mask[24, 34]), 255)
         self.assertEqual(int(mask[2, 2]), 0)
 
+    def test_build_text_union_mask_connect_lines_and_expand(self) -> None:
+        # Two nearby lines should be connected into one box and then expanded.
+        texts = [
+            TextItem(
+                text_id="l1",
+                text="line1",
+                bbox=[20, 20, 60, 30],
+                source="merged",
+                conf=1.0,
+                layer_id=-1,
+                layer_path="",
+                quad=None,
+            ),
+            TextItem(
+                text_id="l2",
+                text="line2",
+                bbox=[22, 33, 62, 43],
+                source="merged",
+                conf=1.0,
+                layer_id=-1,
+                layer_path="",
+                quad=None,
+            ),
+        ]
+        mask = _build_text_union_mask(texts=texts, width=120, height=120)
+        # Original gap center now should be covered because line boxes are connected and expanded.
+        self.assertEqual(int(mask[31, 40]), 255)
+        # Expansion grows left/top beyond original first line bbox.
+        self.assertEqual(int(mask[16, 16]), 255)
+
     def test_detect_raster_text_layers_by_union(self) -> None:
         union_mask = np.zeros((20, 30), dtype=np.uint8)
         union_mask[:, :15] = 255

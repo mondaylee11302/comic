@@ -109,6 +109,19 @@ def _load_dotenv_from_repo_root() -> None:
         return
 
 
+def _resolve_env_float(name: str, default: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return float(default)
+    try:
+        val = float(raw)
+    except Exception:
+        return float(default)
+    if val < float(min_value) or val > float(max_value):
+        return float(default)
+    return float(val)
+
+
 def _clamp_bbox(bbox: Tuple[int, int, int, int], width: int, height: int) -> Tuple[int, int, int, int]:
     x1, y1, x2, y2 = [int(v) for v in bbox]
     x1 = int(np.clip(x1, 0, width))
@@ -382,6 +395,14 @@ def _extract_ocr_texts_from_source(
         if progress_hook is not None:
             progress_hook(msg)
 
+    def _step_start(name: str) -> float:
+        _log(f"step={name} start")
+        return time.perf_counter()
+
+    def _step_done(name: str, start_ts: float) -> None:
+        elapsed_ms = int(max(0, round((time.perf_counter() - start_ts) * 1000.0)))
+        _log(f"step={name} done elapsed_ms={elapsed_ms}")
+
     _load_dotenv_from_repo_root()
     enable = str(os.getenv("VOLC_OCR_ENABLE", "0")).strip().lower() in {"1", "true", "yes", "on"}
     if not enable:
@@ -403,6 +424,7 @@ def _extract_ocr_texts_from_source(
         lang = "zh"
 
     _log(f"ocr: encode input image (grayscale original png), mode={mode}, lang={lang}")
+    t_encode = _step_start("ocr_encode")
     try:
         if source_bgr.ndim == 2:
             gray = source_bgr
@@ -443,7 +465,9 @@ def _extract_ocr_texts_from_source(
                     _log(f"ocr: failed to save gray input -> {gray_png_export_path}")
             except Exception as save_exc:
                 _log(f"ocr: failed to save gray input: {save_exc}")
+        _step_done("ocr_encode", t_encode)
     except Exception as exc:
+        _step_done("ocr_encode", t_encode)
         return OcrExtractResult(
             texts=[],
             status="degraded",
@@ -469,6 +493,7 @@ def _extract_ocr_texts_from_source(
             degraded_reason=f"volc_imagex import failed: {exc}",
         )
 
+    t_request = _step_start("ocr_request")
     try:
         max_retries_raw = str(os.getenv("VOLC_OCR_MAX_RETRIES", "2")).strip()
         try:
@@ -543,6 +568,9 @@ def _extract_ocr_texts_from_source(
                 lang_mode=lang,
             )
         _log(f"ocr: response done ({ocr_result.elapsed_ms}ms), texts={len(ocr_result.texts)}")
+        _step_done("ocr_request", t_request)
+
+        t_parse = _step_start("ocr_parse")
 
         texts: List[TextItem] = []
         src_w = max(1.0, float(request_meta.get("width", width)))
@@ -571,6 +599,7 @@ def _extract_ocr_texts_from_source(
             texts.append(_resolve_geometry(item, width=width, height=height))
 
         status = "ok" if texts else "ok_empty"
+        _step_done("ocr_parse", t_parse)
         return OcrExtractResult(
             texts=texts,
             status=status,
@@ -582,6 +611,7 @@ def _extract_ocr_texts_from_source(
             degraded_reason="",
         )
     except Exception as exc:
+        _step_done("ocr_request", t_request)
         fail_status = "failed_input_limit" if _is_ocr_payload_limit_error(exc) else "degraded"
         return OcrExtractResult(
             texts=[],
@@ -751,38 +781,93 @@ def _layer_rgba_and_bbox(
     width: int,
     height: int,
     prefer_composite: bool = False,
+    debug_stats: Optional[Dict[str, object]] = None,
 ) -> Tuple[np.ndarray | None, Tuple[int, int, int, int]]:
+    begin_ts = time.perf_counter()
+
+    def _set_debug(
+        *,
+        decode_source: str,
+        decode_elapsed_ms: int,
+        decode_ok: bool,
+        decode_error: str = "",
+    ) -> None:
+        if debug_stats is None:
+            return
+        debug_stats["decode_source"] = str(decode_source)
+        debug_stats["decode_elapsed_ms"] = int(max(0, decode_elapsed_ms))
+        debug_stats["decode_ok"] = bool(decode_ok)
+        debug_stats["decode_error"] = str(decode_error or "")
+        debug_stats["rgba_elapsed_ms"] = int(max(0, round((time.perf_counter() - begin_ts) * 1000.0)))
+
     raw_bbox = tuple(int(v) for v in layer.bbox)
     bbox = _clamp_bbox(raw_bbox, width, height)
     if bbox == (0, 0, 0, 0):
+        _set_debug(decode_source="bbox_empty", decode_elapsed_ms=0, decode_ok=False)
         return None, bbox
 
     rgba = None
     if prefer_composite:
+        t0 = time.perf_counter()
         try:
             rendered = layer.composite()
             if rendered is not None:
                 rgba = np.array(rendered)
+                _set_debug(
+                    decode_source="composite_preferred",
+                    decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                    decode_ok=True,
+                )
         except Exception:
             rgba = None
+            _set_debug(
+                decode_source="composite_preferred_error",
+                decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                decode_ok=False,
+            )
 
     if rgba is None:
+        t0 = time.perf_counter()
         try:
             rgba = layer.numpy()
+            if rgba is not None:
+                _set_debug(
+                    decode_source="numpy",
+                    decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                    decode_ok=True,
+                )
         except Exception:
             rgba = None
+            _set_debug(
+                decode_source="numpy_error",
+                decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                decode_ok=False,
+            )
 
     # Fallback to rendered composite only if needed.
     if rgba is None and (not prefer_composite):
+        t0 = time.perf_counter()
         try:
             rendered = layer.composite()
             if rendered is not None:
                 rgba = np.array(rendered)
+                _set_debug(
+                    decode_source="composite_fallback",
+                    decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                    decode_ok=True,
+                )
         except Exception:
             rgba = None
+            _set_debug(
+                decode_source="composite_fallback_error",
+                decode_elapsed_ms=int(max(0, round((time.perf_counter() - t0) * 1000.0))),
+                decode_ok=False,
+            )
     if rgba is None:
+        _set_debug(decode_source="decode_none", decode_elapsed_ms=0, decode_ok=False)
         return None, bbox
     if rgba.ndim != 3 or rgba.shape[2] not in {3, 4}:
+        _set_debug(decode_source="invalid_rgba_shape", decode_elapsed_ms=0, decode_ok=False)
         return None, bbox
 
     if np.issubdtype(rgba.dtype, np.floating):
@@ -801,6 +886,7 @@ def _layer_rgba_and_bbox(
     target_w = max(0, int(bbox[2] - bbox[0]))
     target_h = max(0, int(bbox[3] - bbox[1]))
     if target_w <= 0 or target_h <= 0:
+        _set_debug(decode_source="target_empty", decode_elapsed_ms=0, decode_ok=False)
         return None, bbox
 
     if rgba_u8.shape[0] != target_h or rgba_u8.shape[1] != target_w:
@@ -821,27 +907,103 @@ def _layer_rgba_and_bbox(
         else:
             rgba_u8 = cropped
 
+    _set_debug(
+        decode_source=str(debug_stats.get("decode_source", "unknown")) if debug_stats is not None else "unknown",
+        decode_elapsed_ms=int(debug_stats.get("decode_elapsed_ms", 0)) if debug_stats is not None else 0,
+        decode_ok=True,
+    )
     return rgba_u8, bbox
 
 
 def _build_text_union_mask(texts: List[TextItem], width: int, height: int) -> np.ndarray:
+    def _bbox_connected_with_gap(a: List[int], b: List[int], gap_x: int, gap_y: int) -> bool:
+        ax1, ay1, ax2, ay2 = [int(v) for v in a]
+        bx1, by1, bx2, by2 = [int(v) for v in b]
+        return not (
+            (ax2 + gap_x) < bx1
+            or (bx2 + gap_x) < ax1
+            or (ay2 + gap_y) < by1
+            or (by2 + gap_y) < ay1
+        )
+
+    def _expand_bbox_scale(bbox: List[int], scale: float) -> List[int]:
+        x1, y1, x2, y2 = [float(v) for v in bbox]
+        bw = max(1.0, x2 - x1)
+        bh = max(1.0, y2 - y1)
+        cx = 0.5 * (x1 + x2)
+        cy = 0.5 * (y1 + y2)
+        nw = bw * float(scale)
+        nh = bh * float(scale)
+        ex1 = int(np.floor(cx - 0.5 * nw))
+        ey1 = int(np.floor(cy - 0.5 * nh))
+        ex2 = int(np.ceil(cx + 0.5 * nw))
+        ey2 = int(np.ceil(cy + 0.5 * nh))
+        ex1 = int(np.clip(ex1, 0, width))
+        ey1 = int(np.clip(ey1, 0, height))
+        ex2 = int(np.clip(ex2, 0, width))
+        ey2 = int(np.clip(ey2, 0, height))
+        return [ex1, ey1, ex2, ey2]
+
     mask = np.zeros((height, width), dtype=np.uint8)
+    text_boxes: List[List[int]] = []
     for t in texts:
-        quad = t.quad if (t.quad and len(t.quad) == 4) else _quad_from_bbox(t.bbox)
-        try:
-            pts = np.array([[int(round(p[0])), int(round(p[1]))] for p in quad], dtype=np.int32)
-        except Exception:
-            pts = np.empty((0, 2), dtype=np.int32)
-        if pts.shape == (4, 2):
-            cv2.fillPoly(mask, [pts], 255)
-            continue
-        x1, y1, x2, y2 = [int(v) for v in t.bbox]
+        if t.quad and len(t.quad) == 4:
+            x1, y1, x2, y2 = _bbox_from_quad(t.quad)
+        else:
+            x1, y1, x2, y2 = [int(v) for v in t.bbox]
         x1 = int(np.clip(x1, 0, width))
         x2 = int(np.clip(x2, 0, width))
         y1 = int(np.clip(y1, 0, height))
         y2 = int(np.clip(y2, 0, height))
         if x2 > x1 and y2 > y1:
-            mask[y1:y2, x1:x2] = 255
+            text_boxes.append([x1, y1, x2, y2])
+
+    if not text_boxes:
+        return mask
+
+    text_heights = [max(1, int(b[3] - b[1])) for b in text_boxes]
+    med_h = float(np.median(np.array(text_heights, dtype=np.float32)))
+    gap_y = int(np.clip(round(med_h * 0.60), 2, 96))
+    gap_x = int(np.clip(round(med_h * 0.40), 2, 72))
+
+    n = len(text_boxes)
+    parents = list(range(n))
+
+    def _find(i: int) -> int:
+        while parents[i] != i:
+            parents[i] = parents[parents[i]]
+            i = parents[i]
+        return i
+
+    def _union(a: int, b: int) -> None:
+        ra = _find(a)
+        rb = _find(b)
+        if ra != rb:
+            parents[rb] = ra
+
+    for i in range(n):
+        bi = text_boxes[i]
+        for j in range(i + 1, n):
+            bj = text_boxes[j]
+            if _bbox_connected_with_gap(bi, bj, gap_x=gap_x, gap_y=gap_y):
+                _union(i, j)
+
+    merged_boxes: Dict[int, List[int]] = {}
+    for i, b in enumerate(text_boxes):
+        r = _find(i)
+        if r not in merged_boxes:
+            merged_boxes[r] = [int(b[0]), int(b[1]), int(b[2]), int(b[3])]
+        else:
+            cur = merged_boxes[r]
+            cur[0] = min(cur[0], int(b[0]))
+            cur[1] = min(cur[1], int(b[1]))
+            cur[2] = max(cur[2], int(b[2]))
+            cur[3] = max(cur[3], int(b[3]))
+
+    for b in merged_boxes.values():
+        ex1, ey1, ex2, ey2 = _expand_bbox_scale(b, scale=1.5)
+        if ex2 > ex1 and ey2 > ey1:
+            mask[ey1:ey2, ex1:ex2] = 255
     return mask
 
 
@@ -852,8 +1014,15 @@ def _layer_union_overlap_stats(
     height: int,
     alpha_thr: int = 10,
     prefer_composite: bool = False,
+    layer_debug: Optional[Dict[str, object]] = None,
 ) -> Tuple[int, int, float]:
-    rgba, real_bbox = _layer_rgba_and_bbox(layer, width, height, prefer_composite=prefer_composite)
+    rgba, real_bbox = _layer_rgba_and_bbox(
+        layer,
+        width,
+        height,
+        prefer_composite=prefer_composite,
+        debug_stats=layer_debug,
+    )
     if rgba is None:
         return 0, 0, 0.0
     alpha_bin = rgba[:, :, 3] > int(alpha_thr)
@@ -886,7 +1055,15 @@ def _detect_raster_text_layers_by_union(
     min_pixels: int = 20,
     runtime_id_by_obj: Optional[Dict[int, int]] = None,
     exclude_layer_ids: Optional[set[int]] = None,
+    exclude_text_layer_ids: Optional[set[int]] = None,
+    exclude_raster_text_layer_ids: Optional[set[int]] = None,
+    debug_log: Optional[Callable[[str], None]] = None,
+    slow_rgba_thr_ms: int = 300,
 ) -> List[int]:
+    def _dlog(msg: str) -> None:
+        if debug_log is not None:
+            debug_log(msg)
+
     if text_union_mask.size == 0 or int(np.count_nonzero(text_union_mask)) <= 0:
         return []
 
@@ -902,35 +1079,149 @@ def _detect_raster_text_layers_by_union(
         int(uy + uh),
     )
 
-    excluded = set(exclude_layer_ids or set())
+    excluded_text = set(exclude_text_layer_ids or set())
+    excluded_raster = set(exclude_raster_text_layer_ids or set())
+    excluded_generic = set(exclude_layer_ids or set()) - excluded_text - excluded_raster
+    excluded = set(excluded_text | excluded_raster | excluded_generic)
+
+    _dlog(
+        "detect_text_layers config: text_union_bbox=%s threshold=%.2f alpha_thr=%d min_pixels=%d "
+        "exclude_text=%d exclude_raster=%d exclude_generic=%d"
+        % (
+            [int(v) for v in text_union_bbox],
+            float(in_union_ratio_thr),
+            int(alpha_thr),
+            int(min_pixels),
+            len(excluded_text),
+            len(excluded_raster),
+            len(excluded_generic),
+        )
+    )
+
     scored: List[Tuple[float, int]] = []
     for layer in psd.descendants():
         lid = int(getattr(layer, "layer_id", -1))
         if runtime_id_by_obj is not None:
             lid = int(runtime_id_by_obj.get(id(layer), lid))
+        layer_name = str(getattr(layer, "name", "") or "")
+        kind = str(getattr(layer, "kind", ""))
+        layer_bbox = _clamp_bbox(tuple(int(v) for v in layer.bbox), width, height)
+        excluded_by_text = lid in excluded_text
+        excluded_by_raster = lid in excluded_raster
+        excluded_by_generic = lid in excluded_generic
+
         if lid in excluded:
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=%s excluded_by_raster_text=%s decision=rejected reason=excluded"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    str(bool(excluded_by_text)).lower(),
+                    str(bool(excluded_by_raster)).lower(),
+                )
+            )
             continue
         if not bool(getattr(layer, "visible", True)):
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false decision=rejected reason=not_visible"
+                % (lid, json.dumps(layer_name, ensure_ascii=False), kind or "unknown", [int(v) for v in layer_bbox])
+            )
             continue
-        if str(getattr(layer, "kind", "")) == "group":
+        if kind == "group":
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false decision=rejected reason=group_skip"
+                % (lid, json.dumps(layer_name, ensure_ascii=False), kind or "unknown", [int(v) for v in layer_bbox])
+            )
             continue
-        layer_bbox = _clamp_bbox(tuple(int(v) for v in layer.bbox), width, height)
         if layer_bbox == (0, 0, 0, 0):
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false decision=rejected reason=empty_bbox"
+                % (lid, json.dumps(layer_name, ensure_ascii=False), kind or "unknown", [int(v) for v in layer_bbox])
+            )
             continue
         if not _bboxes_intersect(layer_bbox, text_union_bbox):
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false decision=rejected reason=bbox_no_intersect"
+                % (lid, json.dumps(layer_name, ensure_ascii=False), kind or "unknown", [int(v) for v in layer_bbox])
+            )
             continue
-        layer_pixels, _, overlap_ratio = _layer_union_overlap_stats(
+        layer_debug: Dict[str, object] = {}
+        layer_pixels, overlap_pixels, overlap_ratio = _layer_union_overlap_stats(
             layer=layer,
             text_union_mask=text_union_mask,
             width=width,
             height=height,
             alpha_thr=alpha_thr,
             prefer_composite=False,
+            layer_debug=layer_debug,
         )
+        rgba_elapsed_ms = int(layer_debug.get("rgba_elapsed_ms", 0) or 0)
+        decode_source = str(layer_debug.get("decode_source", "unknown") or "unknown")
+        slow_flag = rgba_elapsed_ms >= int(max(0, slow_rgba_thr_ms))
+
         if layer_pixels < int(min_pixels):
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false rgba_elapsed_ms=%d decode_source=%s "
+                "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f slow=%s decision=rejected reason=min_pixels"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    rgba_elapsed_ms,
+                    decode_source,
+                    int(layer_pixels),
+                    int(overlap_pixels),
+                    float(overlap_ratio),
+                    str(bool(slow_flag)).lower(),
+                )
+            )
             continue
         if overlap_ratio >= float(in_union_ratio_thr):
             scored.append((overlap_ratio, lid))
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false rgba_elapsed_ms=%d decode_source=%s "
+                "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f slow=%s decision=accepted reason=ratio_pass"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    rgba_elapsed_ms,
+                    decode_source,
+                    int(layer_pixels),
+                    int(overlap_pixels),
+                    float(overlap_ratio),
+                    str(bool(slow_flag)).lower(),
+                )
+            )
+        else:
+            _dlog(
+                "detect_text_layer layer_id=%d layer_name=%s kind=%s layer_bbox=%s "
+                "excluded_by_text_layer=false excluded_by_raster_text=false rgba_elapsed_ms=%d decode_source=%s "
+                "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f slow=%s decision=rejected reason=ratio_below_thr"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    rgba_elapsed_ms,
+                    decode_source,
+                    int(layer_pixels),
+                    int(overlap_pixels),
+                    float(overlap_ratio),
+                    str(bool(slow_flag)).lower(),
+                )
+            )
     scored.sort(key=lambda x: x[0], reverse=True)
     return [int(lid) for _, lid in scored]
 
@@ -943,25 +1234,71 @@ def rank_bubble_layers_by_text_union(
     min_pixels: int = 20,
     exclude_layer_ids: Optional[set[int]] = None,
     runtime_id_by_obj: Optional[Dict[int, int]] = None,
+    debug_log: Optional[Callable[[str], None]] = None,
+    slow_rgba_thr_ms: int = 300,
+    slow_topn: int = 10,
 ) -> Tuple[List[BubbleLayerScore], Dict[int, str]]:
+    def _dlog(msg: str) -> None:
+        if debug_log is not None:
+            debug_log(msg)
+
     width, height = [int(v) for v in psd.size]
     canvas_area = max(1.0, float(width * height))
     excluded = set(exclude_layer_ids or set())
     ranking: List[BubbleLayerScore] = []
     layer_path_by_id: Dict[int, str] = {}
+    layers_total = 0
+    layers_evaluated = 0
+    layers_accepted = 0
+    rgba_elapsed_sum_ms = 0
+    max_rgba_elapsed_ms = 0
+    top_rows: List[Tuple[int, int, str, str, float]] = []
+
+    _dlog(
+        "rank_textbox_layers config: threshold=%.2f alpha_thr=%d min_pixels=%d excluded=%d"
+        % (float(overlap_ratio_thr), int(alpha_thr), int(min_pixels), len(excluded))
+    )
 
     for layer in psd.descendants():
+        layers_total += 1
         lid = int(getattr(layer, "layer_id", -1))
         if runtime_id_by_obj is not None:
             lid = int(runtime_id_by_obj.get(id(layer), lid))
         kind = str(getattr(layer, "kind", ""))
-        layer_path_by_id[lid] = _layer_path(layer)
+        layer_name = str(getattr(layer, "name", "") or "")
+        layer_path = _layer_path(layer)
+        layer_path_by_id[lid] = layer_path
+        layer_bbox = _clamp_bbox(tuple(int(v) for v in layer.bbox), width, height)
 
         if lid in excluded:
+            _dlog(
+                "rank_textbox_layer layer_id=%d layer_name=%s layer_path=%s kind=%s layer_bbox=%s "
+                "excluded=true visible=%s decision=rejected reason=excluded"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    json.dumps(layer_path, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    str(bool(getattr(layer, "visible", True))).lower(),
+                )
+            )
             continue
         if not bool(getattr(layer, "visible", True)):
+            _dlog(
+                "rank_textbox_layer layer_id=%d layer_name=%s layer_path=%s kind=%s layer_bbox=%s "
+                "excluded=false visible=false decision=rejected reason=not_visible"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    json.dumps(layer_path, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                )
+            )
             continue
 
+        layer_debug: Dict[str, object] = {}
         layer_pixels, overlap_pixels, overlap_ratio = _layer_union_overlap_stats(
             layer=layer,
             text_union_mask=text_union_mask,
@@ -970,10 +1307,59 @@ def rank_bubble_layers_by_text_union(
             alpha_thr=alpha_thr,
             # Group may carry multi-layer dialog bubble content.
             prefer_composite=(kind == "group"),
+            layer_debug=layer_debug,
         )
+        layers_evaluated += 1
+        rgba_elapsed_ms = int(layer_debug.get("rgba_elapsed_ms", 0) or 0)
+        decode_source = str(layer_debug.get("decode_source", "unknown") or "unknown")
+        slow_flag = rgba_elapsed_ms >= int(max(0, slow_rgba_thr_ms))
+        rgba_elapsed_sum_ms += rgba_elapsed_ms
+        max_rgba_elapsed_ms = max(max_rgba_elapsed_ms, rgba_elapsed_ms)
+        top_rows.append((rgba_elapsed_ms, lid, layer_path, decode_source, float(overlap_ratio)))
+
         if layer_pixels < int(min_pixels):
+            _dlog(
+                "rank_textbox_layer layer_id=%d layer_name=%s layer_path=%s kind=%s layer_bbox=%s "
+                "excluded=false visible=true rgba_elapsed_ms=%d decode_source=%s "
+                "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f bubble_area_ratio=%.6f slow=%s "
+                "decision=rejected reason=min_pixels"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    json.dumps(layer_path, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    int(rgba_elapsed_ms),
+                    decode_source,
+                    int(layer_pixels),
+                    int(overlap_pixels),
+                    float(overlap_ratio),
+                    float(layer_pixels / canvas_area),
+                    str(bool(slow_flag)).lower(),
+                )
+            )
             continue
         if overlap_ratio < float(overlap_ratio_thr):
+            _dlog(
+                "rank_textbox_layer layer_id=%d layer_name=%s layer_path=%s kind=%s layer_bbox=%s "
+                "excluded=false visible=true rgba_elapsed_ms=%d decode_source=%s "
+                "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f bubble_area_ratio=%.6f slow=%s "
+                "decision=rejected reason=rejected_below_thr"
+                % (
+                    lid,
+                    json.dumps(layer_name, ensure_ascii=False),
+                    json.dumps(layer_path, ensure_ascii=False),
+                    kind or "unknown",
+                    [int(v) for v in layer_bbox],
+                    int(rgba_elapsed_ms),
+                    decode_source,
+                    int(layer_pixels),
+                    int(overlap_pixels),
+                    float(overlap_ratio),
+                    float(layer_pixels / canvas_area),
+                    str(bool(slow_flag)).lower(),
+                )
+            )
             continue
 
         bubble_area_ratio = float(layer_pixels / canvas_area)
@@ -995,6 +1381,27 @@ def rank_bubble_layers_by_text_union(
                 text_proximity_ratio=overlap_ratio,
             )
         )
+        layers_accepted += 1
+        _dlog(
+            "rank_textbox_layer layer_id=%d layer_name=%s layer_path=%s kind=%s layer_bbox=%s "
+            "excluded=false visible=true rgba_elapsed_ms=%d decode_source=%s "
+            "layer_pixels=%d overlap_pixels=%d overlap_ratio=%.4f bubble_area_ratio=%.6f slow=%s "
+            "decision=accepted reason=ratio_pass"
+            % (
+                lid,
+                json.dumps(layer_name, ensure_ascii=False),
+                json.dumps(layer_path, ensure_ascii=False),
+                kind or "unknown",
+                [int(v) for v in layer_bbox],
+                int(rgba_elapsed_ms),
+                decode_source,
+                int(layer_pixels),
+                int(overlap_pixels),
+                float(overlap_ratio),
+                float(bubble_area_ratio),
+                str(bool(slow_flag)).lower(),
+            )
+        )
 
     ranking.sort(
         key=lambda x: (
@@ -1004,6 +1411,26 @@ def rank_bubble_layers_by_text_union(
         ),
         reverse=True,
     )
+
+    avg_rgba_elapsed_ms = float(rgba_elapsed_sum_ms / max(1, layers_evaluated))
+    _dlog(
+        "rank_textbox_layers summary: layers_total=%d layers_evaluated=%d layers_accepted=%d "
+        "sum_rgba_elapsed_ms=%d avg_rgba_elapsed_ms=%.1f max_rgba_elapsed_ms=%d"
+        % (
+            int(layers_total),
+            int(layers_evaluated),
+            int(layers_accepted),
+            int(rgba_elapsed_sum_ms),
+            float(avg_rgba_elapsed_ms),
+            int(max_rgba_elapsed_ms),
+        )
+    )
+    top_rows.sort(key=lambda x: x[0], reverse=True)
+    for idx, (ms, lid, path, src, ratio) in enumerate(top_rows[: max(0, int(slow_topn))], start=1):
+        _dlog(
+            "rank_textbox_layers top_slow rank=%d layer_id=%d rgba_elapsed_ms=%d decode_source=%s overlap_ratio=%.4f layer_path=%s"
+            % (int(idx), int(lid), int(ms), src, float(ratio), json.dumps(path, ensure_ascii=False))
+        )
     return ranking, layer_path_by_id
 
 
@@ -1075,21 +1502,49 @@ def preprocess_psd_for_panels(
         if progress_hook is not None:
             progress_hook(msg)
 
+    def _step_start(name: str) -> float:
+        _log(f"step={name} start")
+        return time.perf_counter()
+
+    def _step_done(name: str, start_ts: float) -> None:
+        elapsed_ms = int(max(0, round((time.perf_counter() - start_ts) * 1000.0)))
+        _log(f"step={name} done elapsed_ms={elapsed_ms}")
+
     _ = enable_mask_inpaint
 
-    _log("open psd")
+    _load_dotenv_from_repo_root()
+    raster_text_in_union_ratio_thr = _resolve_env_float(
+        "PREPROCESS_RASTER_TEXT_IN_UNION_RATIO_THR",
+        default=0.85,
+        min_value=0.0,
+        max_value=1.0,
+    )
+    textbox_overlap_ratio_thr = _resolve_env_float(
+        "PREPROCESS_TEXTBOX_OVERLAP_RATIO_THR",
+        default=0.35,
+        min_value=0.0,
+        max_value=1.0,
+    )
+
+    t_step = _step_start("open_psd")
     psd = PSDImage.open(image_path)
     width, height = [int(v) for v in psd.size]
     out_dir.mkdir(parents=True, exist_ok=True)
     ocr_gray_input_path = out_dir / f"{prefix}_ocr_gray_input.png"
     runtime_id_by_obj, layer_by_runtime_id, layer_path_by_runtime_id = _build_runtime_layer_maps(psd)
+    _step_done("open_psd", t_step)
     _log(f"psd opened: size={width}x{height}")
 
-    _log("compose source image")
+    t_step = _step_start("compose_source_image")
     source_bgr = _to_bgr_from_pil(psd.composite())
-    _log("extract psd texts")
+    _step_done("compose_source_image", t_step)
+
+    t_step = _step_start("extract_psd_texts")
     psd_texts = extract_psd_texts(psd, width, height, runtime_id_by_obj=runtime_id_by_obj)
+    _step_done("extract_psd_texts", t_step)
     _log(f"psd texts done: count={len(psd_texts)}")
+
+    t_step = _step_start("ocr_total")
     ocr_result = _extract_ocr_texts_from_source(
         source_bgr,
         width=width,
@@ -1099,12 +1554,15 @@ def preprocess_psd_for_panels(
         ocr_lang=ocr_lang,
         progress_hook=progress_hook,
     )
+    _step_done("ocr_total", t_step)
     _log(
         "ocr done: status=%s, texts=%d, upload_ms=%d, ocr_ms=%d"
         % (ocr_result.status, len(ocr_result.texts), int(ocr_result.upload_latency_ms), int(ocr_result.ocr_latency_ms))
     )
 
+    t_step = _step_start("merge_texts")
     merged_texts, merge_stats = merge_text_items(psd_texts, ocr_result.texts, width=width, height=height)
+    _step_done("merge_texts", t_step)
     _log(
         "merge texts done: merged=%d, unmatched_psd=%d, unmatched_ocr=%d"
         % (
@@ -1115,34 +1573,56 @@ def preprocess_psd_for_panels(
     )
 
     text_layer_ids = {int(t.layer_id) for t in psd_texts if int(t.layer_id) >= 0}
+    t_step = _step_start("build_text_union_mask")
     text_union_mask = _build_text_union_mask(merged_texts, width=width, height=height)
     text_union_pixels = int(np.count_nonzero(text_union_mask))
     text_union_ratio = float(text_union_pixels / max(float(width * height), 1.0))
+    _step_done("build_text_union_mask", t_step)
     _log(f"text union built: pixels={text_union_pixels}, area_ratio={text_union_ratio:.4f}")
 
-    _log("detect raster text layers (union coverage)")
+    t_step = _step_start("detect_raster_text_layers")
     raster_text_layer_ids = _detect_raster_text_layers_by_union(
         psd=psd,
         text_union_mask=text_union_mask,
-        in_union_ratio_thr=0.85,
+        in_union_ratio_thr=raster_text_in_union_ratio_thr,
         alpha_thr=alpha_thr,
         min_pixels=20,
         runtime_id_by_obj=runtime_id_by_obj,
         exclude_layer_ids=set(text_layer_ids),
+        exclude_text_layer_ids=set(text_layer_ids),
+        exclude_raster_text_layer_ids=set(),
+        debug_log=_log,
+        slow_rgba_thr_ms=300,
     )
-    _log(f"raster text layers done (>=85% in text union): count={len(raster_text_layer_ids)}")
+    _step_done("detect_raster_text_layers", t_step)
+    _log(
+        "raster text layers done (>=%d%% in text union): count=%d"
+        % (int(round(raster_text_in_union_ratio_thr * 100.0)), len(raster_text_layer_ids))
+    )
 
-    _log("rank textbox layers (union overlap)")
+    _log(
+        "rank_textbox_layers formula: text_union_source=merged_psd_ocr candidate_scope=include_group "
+        "exclude_before_compute=true ratio_formula=overlap_pixels/candidate_pixels threshold=%.4f"
+        % float(textbox_overlap_ratio_thr)
+    )
+    t_step = _step_start("rank_textbox_layers")
     ranking, layer_path_by_id = rank_bubble_layers_by_text_union(
         psd=psd,
         text_union_mask=text_union_mask,
-        overlap_ratio_thr=0.35,
+        overlap_ratio_thr=textbox_overlap_ratio_thr,
         alpha_thr=alpha_thr,
         min_pixels=20,
         exclude_layer_ids=set(text_layer_ids) | set(raster_text_layer_ids),
         runtime_id_by_obj=runtime_id_by_obj,
+        debug_log=_log,
+        slow_rgba_thr_ms=300,
+        slow_topn=10,
     )
-    _log(f"textbox ranking done (>=35% overlap): candidates={len(ranking)}")
+    _step_done("rank_textbox_layers", t_step)
+    _log(
+        "textbox ranking done (>=%d%% overlap): candidates=%d"
+        % (int(round(textbox_overlap_ratio_thr * 100.0)), len(ranking))
+    )
 
     textbox_layer_ids = [int(r.layer_id) for r in ranking]
     bubble_layer_id: int | None = int(textbox_layer_ids[0]) if textbox_layer_ids else None
@@ -1154,12 +1634,14 @@ def preprocess_psd_for_panels(
     _log(f"textbox layers selected: count={len(textbox_layer_ids)}")
 
     remove_ids = sorted(set(text_layer_ids | set(raster_text_layer_ids) | set(textbox_layer_ids)))
+    t_step = _step_start("build_clean_art")
     _log(f"build clean art: remove_layers={len(remove_ids)}")
     clean_bgr = build_clean_art(
         psd=psd,
         remove_layer_ids=remove_ids,
         layer_by_runtime_id=layer_by_runtime_id,
     )
+    _step_done("build_clean_art", t_step)
     _log("clean art done")
 
     art_clean_path = out_dir / f"{prefix}_art_clean.png"
@@ -1169,6 +1651,7 @@ def preprocess_psd_for_panels(
     textbox_rank_path = out_dir / f"{prefix}_textbox_layer_ranking.json"
     bubble_rank_path = out_dir / f"{prefix}_bubble_layer_ranking.json"
 
+    t_step = _step_start("write_outputs")
     _log("write preprocess outputs")
     cv2.imwrite(str(art_clean_path), clean_bgr)
 
@@ -1185,6 +1668,7 @@ def preprocess_psd_for_panels(
     textbox_rank_path.write_text(json.dumps(ranking_payload, ensure_ascii=False, indent=2), encoding="utf-8")
     # Keep legacy output name for compatibility.
     bubble_rank_path.write_text(json.dumps(ranking_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    _step_done("write_outputs", t_step)
     _log("write preprocess outputs done")
 
     removed_paths = [layer_path_by_runtime_id.get(lid, f"layer#{lid}") for lid in remove_ids]
