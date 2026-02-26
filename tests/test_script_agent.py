@@ -71,10 +71,49 @@ class ScriptAgentTests(unittest.TestCase):
                 user_goal="测试",
                 cfg=cfg,
             )
-            self.assertIn("dialogue", result)
-            self.assertGreaterEqual(len(result["dialogue"]), 2)
+            # Verify new plain text schema
+            self.assertIn("script_text", result)
+            self.assertIn("meta", result)
+            self.assertIsInstance(result["script_text"], str)
+            self.assertGreater(len(result["script_text"]), 0)
             self.assertEqual(result.get("meta", {}).get("backend"), "local_fallback")
+
+    def test_new_schema_text_entries(self) -> None:
+        """Verify plain text output preserves all input texts."""
+        with tempfile.TemporaryDirectory() as td:
+            img = np.full((64, 64, 3), 255, dtype=np.uint8)
+            image_path = Path(td) / "panel_001.png"
+            cv2.imwrite(str(image_path), img)
+
+            selected_rows = [
+                {"text_id": "text_001", "text": "第一句话", "panel_rel_bbox": [0.1, 0.1, 0.3, 0.2]},
+                {"text_id": "text_002", "text": "第二句话", "panel_rel_bbox": [0.6, 0.3, 0.9, 0.4]},
+                {"text_id": "text_003", "text": "第三句话"},
+            ]
+            cfg = ScriptAgentConfig(
+                api_key="",
+                model_endpoint="doubao-seed-1-8-251228",
+                allow_local_fallback=True,
+            )
+            result = generate_panel_script(
+                panel_image_path=str(image_path),
+                selected_rows=selected_rows,
+                user_goal="测试新schema",
+                cfg=cfg,
+            )
+
+            # Verify plain text schema
+            self.assertIn("script_text", result)
+            self.assertIn("meta", result)
+            script_text = result["script_text"]
+            self.assertIsInstance(script_text, str)
+
+            # Verify all input texts appear in the script
+            self.assertIn("第一句话", script_text)
+            self.assertIn("第二句话", script_text)
+            self.assertIn("第三句话", script_text)
 
 
 if __name__ == "__main__":
     unittest.main()
+
