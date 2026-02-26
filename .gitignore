@@ -14,3 +14,15 @@ output/
 
 # UV/Python local env
 .venv/
+
+# Python tool caches
+.ruff_cache/
+.pytest_cache/
+
+# Frontend local deps/build (React workbench)
+web/react/node_modules/
+web/react/dist/
+web/react/.vite/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
