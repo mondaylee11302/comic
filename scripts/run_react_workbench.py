@@ -13,6 +13,7 @@ import csv
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -34,6 +35,7 @@ from app.shared.config import (
     output_dir,
     project_root,
     runtime_data_root,
+    runtime_env_path,
     storyboard_config_path,
     ui_state_dir,
     upload_dir,
@@ -72,6 +74,7 @@ WORKBENCH_UI_STATE_PATH = workbench_ui_state_path()
 UPLOAD_DIR = upload_dir()
 FRONTEND_DIR = frontend_dir()
 CONFIG_PATH = storyboard_config_path()
+RUNTIME_ENV_PATH = runtime_env_path()
 
 # In-memory run registry  { runId: { ... } }
 _runs: Dict[str, Dict[str, Any]] = {}
@@ -166,6 +169,61 @@ def _save_workbench_ui_state(state: dict) -> None:
         json.dumps(state, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def _mask_secret(secret: str) -> str:
+    value = str(secret or "").strip()
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:4]}{'*' * max(4, len(value) - 8)}{value[-4:]}"
+
+
+def _upsert_env_file_values(env_path: Path, values: Dict[str, str]) -> None:
+    env_path.parent.mkdir(parents=True, exist_ok=True)
+    lines: List[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+
+    updated = set()
+    out_lines: List[str] = []
+    pattern_cache = {
+        key: re.compile(rf"^\s*{re.escape(key)}\s*=")
+        for key in values
+    }
+
+    for line in lines:
+        replaced = False
+        for key, pattern in pattern_cache.items():
+            if pattern.match(line):
+                out_lines.append(f"{key}={values[key]}")
+                updated.add(key)
+                replaced = True
+                break
+        if not replaced:
+            out_lines.append(line)
+
+    for key, value in values.items():
+        if key not in updated:
+            out_lines.append(f"{key}={value}")
+
+    payload = "\n".join(out_lines).rstrip() + "\n"
+    env_path.write_text(payload, encoding="utf-8")
+
+
+def _runtime_settings_payload() -> Dict[str, Any]:
+    api_key = str(os.environ.get("SCRIPT_AGENT_API_KEY", os.environ.get("VOLC_API_KEY", "")) or "").strip()
+    return {
+        "hasApiKey": bool(api_key),
+        "apiKeyMasked": _mask_secret(api_key),
+        "defaults": {
+            "scriptModel": os.environ.get("SCRIPT_AGENT_MODEL", "doubao-seed-1-8-251228"),
+            "baseUrl": os.environ.get("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"),
+            "ocrEnabled": str(os.environ.get("VOLC_OCR_ENABLE", "0") or "0") == "1",
+            "splitStrategy": "normal",
+        },
+    }
 
 
 def _normalize_loaded_run(run: dict, *, has_pipeline_meta: bool) -> dict:
@@ -458,6 +516,35 @@ def health():
 def get_workbench_ui_state():
     """Load persisted global UI state for the workbench frontend."""
     return _load_workbench_ui_state()
+
+
+@app.get("/api/settings/runtime")
+def get_runtime_settings():
+    """Expose minimal runtime settings required by the desktop app."""
+    return _runtime_settings_payload()
+
+
+@app.patch("/api/settings/runtime")
+async def patch_runtime_settings(request: dict):
+    """Persist runtime settings under the user data directory."""
+    if not isinstance(request, dict):
+        raise HTTPException(400, "Request body must be a JSON object")
+
+    api_key = str(request.get("apiKey", "") or "").strip()
+    if not api_key:
+        raise HTTPException(400, "API Key is required")
+
+    _upsert_env_file_values(
+        RUNTIME_ENV_PATH,
+        {
+            "VOLC_API_KEY": api_key,
+            "SCRIPT_AGENT_API_KEY": api_key,
+        },
+    )
+    os.environ["VOLC_API_KEY"] = api_key
+    os.environ["SCRIPT_AGENT_API_KEY"] = api_key
+
+    return {"status": "ok", "settings": _runtime_settings_payload()}
 
 
 @app.patch("/api/ui/workbench-state")

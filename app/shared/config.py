@@ -61,6 +61,10 @@ def load_runtime_dotenv() -> None:
         seen.add(resolved)
 
 
+def runtime_env_path() -> Path:
+    return runtime_data_root() / ".env"
+
+
 def project_root() -> Path:
     return resource_root()
 

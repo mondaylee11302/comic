@@ -70,6 +70,15 @@ const S = {
   assetDetailLoading: {}, // file -> boolean
   activeAssetDetail: null, // { file, selectedPanelId }
   assetNoteSaving: {}, // `${file}::${panelId}` -> bool
+  settings: {
+    apiKeyInput: '',
+    hasApiKey: false,
+    apiKeyMasked: '',
+    defaults: null,
+    loading: false,
+    saving: false,
+    loaded: false,
+  },
   // misc
   pollTimer: null,
   loading: {},
@@ -135,6 +144,53 @@ async function loadWorkbenchUiState() {
     console.warn('loadWorkbenchUiState failed', e);
   } finally {
     uiStateHydrated = true;
+  }
+}
+
+async function fetchRuntimeSettings() {
+  S.settings.loading = true;
+  try {
+    const payload = await apiFetch('/api/settings/runtime');
+    S.settings.hasApiKey = !!payload?.hasApiKey;
+    S.settings.apiKeyMasked = payload?.apiKeyMasked || '';
+    S.settings.defaults = payload?.defaults || null;
+    S.settings.loaded = true;
+    return payload;
+  } catch (e) {
+    console.warn('fetchRuntimeSettings failed', e);
+    throw e;
+  } finally {
+    S.settings.loading = false;
+  }
+}
+
+async function saveRuntimeSettings() {
+  const apiKey = String(S.settings.apiKeyInput || '').trim();
+  if (!apiKey) {
+    toast('请输入 API Key', 'error');
+    return false;
+  }
+  S.settings.saving = true;
+  render();
+  try {
+    const res = await apiFetch('/api/settings/runtime', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey }),
+    });
+    const next = res?.settings || {};
+    S.settings.hasApiKey = !!next.hasApiKey;
+    S.settings.apiKeyMasked = next.apiKeyMasked || '';
+    S.settings.defaults = next.defaults || S.settings.defaults;
+    S.settings.apiKeyInput = '';
+    toast('API Key 已保存', 'success');
+    return true;
+  } catch (e) {
+    toast(`保存失败: ${e.message}`, 'error');
+    return false;
+  } finally {
+    S.settings.saving = false;
+    render();
   }
 }
 
@@ -1698,9 +1754,50 @@ function renderAssetDetailDialog() {
 //  SETTINGS
 // ======================================================================
 function renderSettings() {
+  const defaults = S.settings.defaults || {};
+  const placeholder = S.settings.hasApiKey
+    ? (S.settings.apiKeyMasked || '已保存，重新输入可覆盖')
+    : '请输入你的 API Key';
   return `
-  <div class="page-header" > <div><h1 class="page-title">设置</h1><p class="page-subtitle">配置系统参数和默认值</p></div></div>
-    <div class="settings-placeholder"><div class="settings-icon">${I.settings}</div><div class="settings-title">设置功能开发中</div><div class="settings-desc">将包括默认策略、OCR 配置、输出路径等选项</div></div>`;
+  <div class="page-header"><div><h1 class="page-title">设置</h1><p class="page-subtitle">用户只需要填写 API Key，其余参数使用预设值</p></div></div>
+    <div class="settings-panel">
+      <section class="settings-card">
+        <div class="settings-card-head">
+          <div>
+            <div class="settings-card-title">模型访问</div>
+            <div class="settings-card-desc">首次启动只需配置一次。保存后会写入本机用户目录。</div>
+          </div>
+          <div class="settings-status ${S.settings.hasApiKey ? 'ready' : 'missing'}">${S.settings.hasApiKey ? '已配置' : '未配置'}</div>
+        </div>
+        <label class="settings-field">
+          <span class="settings-label">API Key</span>
+          <input
+            id="settingsApiKeyInput"
+            class="prompt-input settings-input"
+            type="password"
+            autocomplete="off"
+            spellcheck="false"
+            value="${escAttr(S.settings.apiKeyInput)}"
+            placeholder="${escAttr(placeholder)}"
+          />
+        </label>
+        <div class="settings-actions">
+          <button class="btn btn-primary" onclick="saveRuntimeSettings()" ${S.settings.saving ? 'disabled' : ''}>${S.settings.saving ? '保存中...' : '保存 API Key'}</button>
+          <button class="btn btn-secondary" onclick="openWorkbenchFromSettings()" ${S.settings.hasApiKey ? '' : 'disabled'}>进入工作台</button>
+        </div>
+      </section>
+
+      <section class="settings-card settings-card-muted">
+        <div class="settings-card-title">已预设参数</div>
+        <div class="settings-preset-list">
+          <div class="settings-preset-item"><span>脚本模型</span><strong>${escHtml(defaults.scriptModel || 'doubao-seed-1-8-251228')}</strong></div>
+          <div class="settings-preset-item"><span>接口地址</span><strong>${escHtml(defaults.baseUrl || 'https://ark.cn-beijing.volces.com/api/v3')}</strong></div>
+          <div class="settings-preset-item"><span>默认分镜策略</span><strong>${escHtml(defaults.splitStrategy || 'normal')}</strong></div>
+          <div class="settings-preset-item"><span>OCR 开关</span><strong>${defaults.ocrEnabled ? '开启' : '关闭'}</strong></div>
+        </div>
+        <div class="settings-footnote">如需更换预设，由应用维护者统一修改，不要求最终用户干预。</div>
+      </section>
+    </div>`;
 }
 
 // ======================================================================
@@ -1732,6 +1829,19 @@ function bindEvents() {
   document.querySelectorAll('[data-action="searchAssets"]').forEach(el => {
     el.addEventListener('input', e => { S.assetSearch = e.target.value; render(); focusInput('[data-action="searchAssets"]', e.target.selectionStart); });
   });
+
+  const settingsApiKeyInput = document.getElementById('settingsApiKeyInput');
+  if (settingsApiKeyInput) {
+    settingsApiKeyInput.addEventListener('input', e => {
+      S.settings.apiKeyInput = e.target.value;
+    });
+    settingsApiKeyInput.addEventListener('keydown', async e => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        await window.saveRuntimeSettings();
+      }
+    });
+  }
 
   // Filters
   document.querySelectorAll('.filter-tab[data-filter]').forEach(el => {
@@ -2153,6 +2263,15 @@ window.handleExport = async function () {
   } catch (e) { toast(`导出失败: ${e.message} `, 'error'); }
 };
 
+window.saveRuntimeSettings = async function () {
+  return await saveRuntimeSettings();
+};
+
+window.openWorkbenchFromSettings = function () {
+  if (!S.settings.hasApiKey) return;
+  navigate(S.agentModule === 'director' ? 'director' : 'storyboard');
+};
+
 // ============ Helpers ============
 function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 function escAttr(s) {
@@ -2181,6 +2300,15 @@ function toast(msg, type = 'info') {
 document.addEventListener('DOMContentLoaded', async () => {
   document.querySelectorAll('.nav-tab').forEach(t => { t.onclick = () => navigate(t.dataset.tab); });
   await loadWorkbenchUiState();
+  try {
+    await fetchRuntimeSettings();
+  } catch (e) {
+    toast('加载设置失败，请稍后重试', 'error');
+  }
+  if (!S.settings.hasApiKey) {
+    navigate('settings');
+    return;
+  }
   if (S.view === 'settings') {
     navigate('settings');
     return;

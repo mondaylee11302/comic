@@ -1226,36 +1226,117 @@ a {
     margin-top: 2px;
 }
 
-/* --- Settings Placeholder --- */
-.settings-placeholder {
+/* --- Settings --- */
+.settings-panel {
+    display: grid;
+    gap: 20px;
+}
+
+.settings-card {
     background: var(--color-surface);
     border: 1px solid var(--color-border);
     border-radius: var(--radius-lg);
-    padding: 80px 40px;
-    text-align: center;
+    padding: 24px;
     box-shadow: var(--shadow-sm);
 }
 
-.settings-icon {
-    width: 72px;
-    height: 72px;
-    margin: 0 auto 24px;
-    color: var(--color-text-muted);
-    opacity: 0.5;
+.settings-card-muted {
+    background: color-mix(in srgb, var(--color-surface) 88%, white 12%);
 }
 
-.settings-title {
+.settings-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 20px;
+}
+
+.settings-card-title {
     font-size: 18px;
-    font-weight: 600;
-    color: var(--color-text-secondary);
-    margin-bottom: 8px;
+    font-weight: 700;
+    color: var(--color-text-primary);
 }
 
-.settings-desc {
+.settings-card-desc {
+    margin-top: 6px;
     font-size: 14px;
+    color: var(--color-text-secondary);
+}
+
+.settings-status {
+    flex: none;
+    padding: 7px 12px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+}
+
+.settings-status.ready {
+    background: rgba(35, 158, 102, 0.12);
+    color: #1d7e52;
+}
+
+.settings-status.missing {
+    background: rgba(214, 89, 58, 0.12);
+    color: #b5492c;
+}
+
+.settings-field {
+    display: grid;
+    gap: 8px;
+}
+
+.settings-label {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--color-text-primary);
+}
+
+.settings-input {
+    min-height: 54px;
+}
+
+.settings-actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 18px;
+    flex-wrap: wrap;
+}
+
+.settings-preset-list {
+    display: grid;
+    gap: 10px;
+    margin-top: 16px;
+}
+
+.settings-preset-item {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: rgba(255, 255, 255, 0.55);
+}
+
+.settings-preset-item span {
+    color: var(--color-text-secondary);
+    font-size: 14px;
+}
+
+.settings-preset-item strong {
+    color: var(--color-text-primary);
+    font-size: 14px;
+    font-weight: 600;
+    text-align: right;
+}
+
+.settings-footnote {
+    margin-top: 14px;
+    font-size: 13px;
     color: var(--color-text-muted);
-    max-width: 400px;
-    margin: 0 auto;
 }
 
 /* --- Toast --- */
