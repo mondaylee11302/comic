@@ -66,6 +66,7 @@ def main() -> None:
         port=port,
         log_level="warning",
         access_log=False,
+        log_config=None,
     )
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None
