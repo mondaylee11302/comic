@@ -2,16 +2,18 @@
    子曰工坊V2 — Workbench + Script Studio
    ======================================== */
 
-// ============ API ============
-const API_BASE = (import.meta.env?.VITE_API_BASE || '').replace(/\/+$/, '');
-
-async function apiFetch(path, opts = {}) {
-  const url = path.startsWith('http') ? path : `${API_BASE}${path}`;
-  const res = await fetch(url, opts);
-  if (!res.ok) { const t = await res.text(); throw new Error(`${res.status}: ${t}`); }
-  return res.json();
-}
-function fileUrl(p) { return `${API_BASE}/api/file?path=${encodeURIComponent(p)}`; }
+import { API_BASE, apiFetch, fileUrl } from './src/shared/api/client.js';
+import {
+  STORYBOARD_AGENT_TITLE,
+  STORYBOARD_DEFAULT_TAB,
+  STORYBOARD_TABS,
+} from './src/agents/storyboard/meta.js';
+import {
+  DIRECTOR_AGENT_TITLE,
+} from './src/agents/director/meta.js';
+import { DIRECTOR_STEP6_REVIEW_TABS, DIRECTOR_STEPS } from './src/agents/director/constants.js';
+import { createDirectorInitialState } from './src/agents/director/state.js';
+import { renderDirectorAgentView } from './src/agents/director/view.js';
 
 // ============ Icons ============
 const I = {
@@ -35,8 +37,10 @@ const I = {
 // ============ State ============
 const S = {
   view: 'agent',
-  tab: 'agent',
-  agentTab: 'split', // 'split' | 'tasks' | 'studio' | 'assets'
+  tab: 'storyboard',
+  agentModule: 'storyboard', // 'storyboard' | 'director'
+  agentTab: STORYBOARD_DEFAULT_TAB, // storyboard sub-tabs
+  director: createDirectorInitialState(),
   // workbench
   runs: [],
   statusFilter: 'all',
@@ -78,8 +82,9 @@ let uiStateSaveTimer = null;
 function serializeWorkbenchUiState() {
   return {
     view: S.view === 'settings' ? 'settings' : 'agent',
-    tab: S.tab === 'settings' ? 'settings' : 'agent',
-    agentTab: ['split', 'tasks', 'studio', 'assets'].includes(S.agentTab) ? S.agentTab : 'split',
+    tab: S.tab === 'settings' ? 'settings' : (S.agentModule === 'director' ? 'director' : 'storyboard'),
+    agentModule: S.agentModule === 'director' ? 'director' : 'storyboard',
+    agentTab: STORYBOARD_TABS.includes(S.agentTab) ? S.agentTab : STORYBOARD_DEFAULT_TAB,
     statusFilter: S.statusFilter || 'all',
     searchQ: S.searchQ || '',
     assetSearch: S.assetSearch || '',
@@ -100,9 +105,11 @@ function serializeWorkbenchUiState() {
 function applyWorkbenchUiState(state) {
   if (!state || typeof state !== 'object') return;
   const topView = state.view === 'settings' ? 'settings' : 'agent';
+  const agentModule = state.agentModule === 'director' ? 'director' : 'storyboard';
   S.view = topView;
-  S.tab = topView;
-  if (['split', 'tasks', 'studio', 'assets'].includes(state.agentTab)) S.agentTab = state.agentTab;
+  S.agentModule = agentModule;
+  S.tab = topView === 'settings' ? 'settings' : agentModule;
+  if (STORYBOARD_TABS.includes(state.agentTab)) S.agentTab = state.agentTab;
   if (['all', 'success', 'running', 'error'].includes(state.statusFilter)) S.statusFilter = state.statusFilter;
   if (typeof state.searchQ === 'string') S.searchQ = state.searchQ;
   if (typeof state.assetSearch === 'string') S.assetSearch = state.assetSearch;
@@ -238,14 +245,25 @@ function stopPoll() { if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer
 
 // ============ Router ============
 function navigate(view, opts) {
-  S.view = view;
-  S.tab = view;
+  const targetView = view === 'settings' ? 'settings' : 'agent';
+  if (view === 'storyboard') S.agentModule = 'storyboard';
+  if (view === 'director') {
+    S.agentModule = 'director';
+    if (S.director) S.director.uiPage = 'home';
+  }
+  if (targetView === 'agent' && (opts?.agentTab || opts?.runId)) S.agentModule = 'storyboard';
+  S.view = targetView;
+  S.tab = targetView === 'settings' ? 'settings' : S.agentModule;
   S.imagePreviewDialog = null;
   S.hoverStudioPanel = null;
   S.activeAssetDetail = null;
   document.querySelectorAll('.nav-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === S.tab));
 
-  if (view === 'agent') {
+  if (targetView === 'agent') {
+    if (S.agentModule === 'director') {
+      render();
+      return;
+    }
     if (opts?.agentTab) S.agentTab = opts.agentTab;
     // If switching to studio sub-tab with a runId
     if (opts?.runId) {
@@ -290,6 +308,746 @@ window.setAgentTab = function (tab) {
     if (done) { fetchStudioResult(done.id).then(() => render()); return; }
   }
   render();
+};
+
+window.setAgentModule = function (module) {
+  if (!['storyboard', 'director'].includes(module)) return;
+  S.agentModule = module;
+  if (module === 'director' && S.director) {
+    S.director.uiPage = 'home';
+  }
+  S.imagePreviewDialog = null;
+  S.hoverStudioPanel = null;
+  S.activeAssetDetail = null;
+  render();
+};
+
+function resetDirectorWorkspaceWithShell(projectCard) {
+  const prev = S.director || createDirectorInitialState();
+  const fresh = createDirectorInitialState();
+  fresh.uiPage = 'workspace';
+  fresh.projectShelf = prev.projectShelf || fresh.projectShelf;
+
+  if (projectCard && typeof projectCard === 'object') {
+    fresh.workspaceProjectMeta = {
+      id: projectCard.id || 'local_project',
+      title: projectCard.title || '未命名剧本',
+      updatedAt: projectCard.updatedAt || '刚刚',
+      isNew: false,
+    };
+    fresh.form.movie_name = projectCard.title || '';
+    fresh.form.type = projectCard.type || '';
+    fresh.form.duration = projectCard.duration || '';
+    fresh.form.tone = projectCard.tone || '';
+    fresh.form.reference_ip = projectCard.referenceIp || '';
+    fresh.project = {
+      project_id: `director_local_${String(projectCard.id || 'demo')}`,
+      movie_name: fresh.form.movie_name,
+      type: fresh.form.type,
+      duration: fresh.form.duration,
+      tone: fresh.form.tone,
+      reference_ip: fresh.form.reference_ip,
+      status: 'created',
+    };
+  } else {
+    fresh.workspaceProjectMeta = {
+      id: `draft_new_${Date.now()}`,
+      title: '未命名剧本',
+      updatedAt: '刚刚',
+      isNew: true,
+    };
+  }
+
+  S.director = fresh;
+}
+
+window.setDirectorUiPage = function (page) {
+  if (!S.director) return;
+  if (!['home', 'projects', 'workspace'].includes(page)) return;
+  S.view = 'agent';
+  S.tab = 'director';
+  S.agentModule = 'director';
+  S.director.uiPage = page;
+  render();
+};
+
+window.openDirectorProjectShelf = function () {
+  window.setDirectorUiPage('projects');
+};
+
+window.openDirectorNewScriptWorkspace = function () {
+  S.view = 'agent';
+  S.tab = 'director';
+  S.agentModule = 'director';
+  resetDirectorWorkspaceWithShell(null);
+  render();
+};
+
+window.openDirectorProjectWorkspace = function (projectId) {
+  if (!S.director?.projectShelf?.items) return;
+  const card = S.director.projectShelf.items.find((item) => item && item.id === projectId);
+  if (!card) return;
+  S.view = 'agent';
+  S.tab = 'director';
+  S.agentModule = 'director';
+  resetDirectorWorkspaceWithShell(card);
+  render();
+};
+
+window.setDirectorField = function (field, value) {
+  if (!S.director?.form || !Object.prototype.hasOwnProperty.call(S.director.form, field)) return;
+  S.director.form[field] = value;
+};
+
+window.setDirectorStep = function (step) {
+  if (!S.director || !Object.values(DIRECTOR_STEPS).includes(step)) return;
+  S.director.uiPage = 'workspace';
+  S.director.step = step;
+  render();
+};
+
+window.setDirectorCreativeField = function (field, value) {
+  if (!S.director?.creativePanel || !Object.prototype.hasOwnProperty.call(S.director.creativePanel, field)) return;
+  S.director.creativePanel[field] = value;
+};
+
+window.applyDirectorCreativeExample = function (field, example) {
+  if (!S.director?.creativePanel || !Object.prototype.hasOwnProperty.call(S.director.creativePanel, field)) return;
+  S.director.creativePanel[field] = String(example ?? '');
+  render();
+};
+
+window.setDirectorStep1Field = function (field, value) {
+  if (!S.director?.step1?.form || !Object.prototype.hasOwnProperty.call(S.director.step1.form, field)) return;
+  S.director.step1.form[field] = value;
+};
+
+window.setDirectorStep2Field = function (field, value) {
+  if (!S.director?.step2?.form || !Object.prototype.hasOwnProperty.call(S.director.step2.form, field)) return;
+  S.director.step2.form[field] = value;
+};
+
+window.setDirectorStep3Field = function (field, value) {
+  if (!S.director?.step3?.form || !Object.prototype.hasOwnProperty.call(S.director.step3.form, field)) return;
+  S.director.step3.form[field] = value;
+};
+
+window.setDirectorStep4Field = function (field, value) {
+  if (!S.director?.step4?.form || !Object.prototype.hasOwnProperty.call(S.director.step4.form, field)) return;
+  S.director.step4.form[field] = value;
+};
+
+window.setDirectorStep5Field = function (field, value) {
+  if (!S.director?.step5?.form || !Object.prototype.hasOwnProperty.call(S.director.step5.form, field)) return;
+  S.director.step5.form[field] = value;
+};
+
+window.setDirectorStep6Field = function (field, value) {
+  if (!S.director?.step6?.form || !Object.prototype.hasOwnProperty.call(S.director.step6.form, field)) return;
+  S.director.step6.form[field] = value;
+};
+
+window.setDirectorStep6Tab = function (tab) {
+  if (!S.director?.step6) return;
+  if (!Object.values(DIRECTOR_STEP6_REVIEW_TABS).includes(tab)) return;
+  S.director.step6.activeTab = tab;
+  render();
+};
+
+window.setDirectorStep7Field = function (field, value) {
+  if (!S.director?.step7?.form || !Object.prototype.hasOwnProperty.call(S.director.step7.form, field)) return;
+  S.director.step7.form[field] = value;
+};
+
+window.setDirectorStep8Field = function (field, value) {
+  if (!S.director?.step8?.form || !Object.prototype.hasOwnProperty.call(S.director.step8.form, field)) return;
+  S.director.step8.form[field] = value;
+};
+
+window.toggleDirectorExportItem = function (item, checked) {
+  if (!S.director?.step8?.form) return;
+  const cur = Array.isArray(S.director.step8.form.export_items) ? S.director.step8.form.export_items : [];
+  const next = cur.filter((x) => x !== item);
+  if (checked) next.push(item);
+  S.director.step8.form.export_items = next;
+};
+
+function resetDirectorStep8Result() {
+  if (!S.director?.step8) return;
+  S.director.step8.error = '';
+  S.director.step8.result = null;
+}
+
+window.toggleDirectorReviewDimension = function (dimension, checked) {
+  if (!S.director?.step6?.form) return;
+  const cur = Array.isArray(S.director.step6.form.review_dimensions) ? S.director.step6.form.review_dimensions : [];
+  const next = cur.filter((item) => item !== dimension);
+  if (checked) next.push(dimension);
+  S.director.step6.form.review_dimensions = next;
+};
+
+window.setDirectorReviewTaskSelection = function (taskId, action) {
+  if (!S.director?.step6) return;
+  if (!S.director.step6.taskSelections || typeof S.director.step6.taskSelections !== 'object') {
+    S.director.step6.taskSelections = {};
+  }
+  S.director.step6.taskSelections[String(taskId)] = String(action || '');
+  if (S.director.step7) {
+    S.director.step7.error = '';
+    S.director.step7.result = null;
+
+    resetDirectorStep8Result();
+  }
+};
+
+window.selectDirectorLogline = function (index) {
+  if (!S.director?.step1 || !Array.isArray(S.director.step1.result?.loglines)) return;
+  if (!Number.isInteger(index) || index < 0 || index >= S.director.step1.result.loglines.length) return;
+  S.director.step1.selected_logline_index = index;
+  if (S.director.step2) {
+    S.director.step2.result = null;
+    S.director.step2.error = '';
+  }
+  if (S.director.step3) {
+    S.director.step3.result = null;
+    S.director.step3.error = '';
+  }
+  if (S.director.step4) {
+    S.director.step4.result = null;
+    S.director.step4.error = '';
+  }
+  if (S.director.step5) {
+    S.director.step5.result = null;
+    S.director.step5.error = '';
+  }
+  if (S.director.step6) {
+    S.director.step6.result = null;
+    S.director.step6.error = '';
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  }
+  render();
+};
+
+window.selectDirectorMode = function (index) {
+  if (!S.director?.step1 || !Array.isArray(S.director.step1.result?.modes)) return;
+  if (!Number.isInteger(index) || index < 0 || index >= S.director.step1.result.modes.length) return;
+  S.director.step1.selected_mode_index = index;
+  if (S.director.step2) {
+    S.director.step2.result = null;
+    S.director.step2.error = '';
+  }
+  if (S.director.step3) {
+    S.director.step3.result = null;
+    S.director.step3.error = '';
+  }
+  if (S.director.step4) {
+    S.director.step4.result = null;
+    S.director.step4.error = '';
+  }
+  if (S.director.step5) {
+    S.director.step5.result = null;
+    S.director.step5.error = '';
+  }
+  if (S.director.step6) {
+    S.director.step6.result = null;
+    S.director.step6.error = '';
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  }
+  render();
+};
+
+window.handleDirectorCreateProject = async function () {
+  if (!S.director || S.director.creating) return;
+  S.director.creating = true;
+  S.director.error = '';
+  render();
+  try {
+    const payload = {
+      movie_name: S.director.form.movie_name || '',
+      type: S.director.form.type || '',
+      duration: S.director.form.duration || '',
+      tone: S.director.form.tone || '',
+      reference_ip: S.director.form.reference_ip || '',
+    };
+    const res = await apiFetch('/api/director/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.project = res?.project || null;
+    if (S.director.project) {
+      const projectTitle = String(S.director.project.movie_name || S.director.form.movie_name || '').trim() || '未命名剧本';
+      if (!S.director.workspaceProjectMeta || typeof S.director.workspaceProjectMeta !== 'object') {
+        S.director.workspaceProjectMeta = {
+          id: `draft_new_${Date.now()}`,
+          title: projectTitle,
+          updatedAt: '刚刚',
+          isNew: true,
+        };
+      } else {
+        S.director.workspaceProjectMeta.title = projectTitle;
+        S.director.workspaceProjectMeta.updatedAt = '刚刚';
+      }
+      S.director.step1.error = '';
+      S.director.step1.result = null;
+      S.director.step1.selected_logline_index = null;
+      S.director.step1.selected_mode_index = null;
+      S.director.step2.error = '';
+      S.director.step2.result = null;
+      S.director.step3.error = '';
+      S.director.step3.result = null;
+      S.director.step4.error = '';
+      S.director.step4.result = null;
+      S.director.step5.error = '';
+      S.director.step5.result = null;
+      S.director.step6.error = '';
+      S.director.step6.result = null;
+      S.director.step6.taskSelections = {};
+      if (S.director.step7) {
+        S.director.step7.error = '';
+        S.director.step7.result = null;
+
+        resetDirectorStep8Result();
+      }
+    }
+  } catch (e) {
+    S.director.error = e?.message || '创建项目失败';
+  } finally {
+    S.director.creating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateSeed = async function () {
+  if (!S.director?.step1 || S.director.step1.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step1.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  S.director.step1.generating = true;
+  S.director.step1.error = '';
+  render();
+  try {
+    const payload = {
+      seed: S.director.step1.form.seed || '',
+      protagonist: S.director.step1.form.protagonist || '',
+      antagonist: S.director.step1.form.antagonist || '',
+      core_synopsis: S.director.step1.form.core_synopsis || '',
+      key_setting: S.director.step1.form.key_setting || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/seed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step1.result = res?.seed_result || null;
+    S.director.step1.selected_logline_index = null;
+    S.director.step1.selected_mode_index = null;
+    S.director.step2.error = '';
+    S.director.step2.result = null;
+    S.director.step3.error = '';
+    S.director.step3.result = null;
+    S.director.step4.error = '';
+    S.director.step4.result = null;
+    S.director.step5.error = '';
+    S.director.step5.result = null;
+    S.director.step6.error = '';
+    S.director.step6.result = null;
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  } catch (e) {
+    S.director.step1.error = e?.message || '生成初始种子失败';
+  } finally {
+    S.director.step1.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateBlueprint = async function () {
+  if (!S.director?.step2 || S.director.step2.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step2.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step2.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+
+  S.director.step2.generating = true;
+  S.director.step2.error = '';
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      audience: S.director.step2.form.audience || '',
+      narrative_focus: S.director.step2.form.narrative_focus || '',
+      ending_tendency: S.director.step2.form.ending_tendency || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/blueprint`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step2.result = res?.blueprint_result || null;
+    S.director.step3.error = '';
+    S.director.step3.result = null;
+    S.director.step4.error = '';
+    S.director.step4.result = null;
+    S.director.step5.error = '';
+    S.director.step5.result = null;
+    S.director.step6.error = '';
+    S.director.step6.result = null;
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  } catch (e) {
+    S.director.step2.error = e?.message || '生成结构蓝图失败';
+  } finally {
+    S.director.step2.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateBeats = async function () {
+  if (!S.director?.step3 || S.director.step3.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step3.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step3.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+  if (!S.director.step2?.result) {
+    S.director.step3.error = '请先生成“结构蓝图”';
+    render();
+    return;
+  }
+
+  S.director.step3.generating = true;
+  S.director.step3.error = '';
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      segment_granularity: S.director.step3.form.segment_granularity || '',
+      action_ratio: S.director.step3.form.action_ratio || '',
+      character_ratio: S.director.step3.form.character_ratio || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/beats`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step3.result = res?.beats_result || null;
+    S.director.step4.error = '';
+    S.director.step4.result = null;
+    S.director.step5.error = '';
+    S.director.step5.result = null;
+    S.director.step6.error = '';
+    S.director.step6.result = null;
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  } catch (e) {
+    S.director.step3.error = e?.message || '生成段落节拍失败';
+  } finally {
+    S.director.step3.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateScenes = async function () {
+  if (!S.director?.step4 || S.director.step4.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step4.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step4.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+  if (!S.director.step3?.result) {
+    S.director.step4.error = '请先生成“段落节拍”';
+    render();
+    return;
+  }
+
+  S.director.step4.generating = true;
+  S.director.step4.error = '';
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      target_scene_count: S.director.step4.form.target_scene_count || '',
+      scene_constraints: S.director.step4.form.scene_constraints || '',
+      language_style: S.director.step4.form.language_style || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/scenes`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step4.result = res?.scenes_result || null;
+    S.director.step5.error = '';
+    S.director.step5.result = null;
+    S.director.step6.error = '';
+    S.director.step6.result = null;
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  } catch (e) {
+    S.director.step4.error = e?.message || '生成分场表失败';
+  } finally {
+    S.director.step4.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateDraft = async function () {
+  if (!S.director?.step5 || S.director.step5.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step5.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step5.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+  if (!S.director.step4?.result) {
+    S.director.step5.error = '请先生成“分场表”';
+    render();
+    return;
+  }
+
+  S.director.step5.generating = true;
+  S.director.step5.error = '';
+  if (S.director.step6) {
+    S.director.step6.error = '';
+    S.director.step6.result = null;
+    S.director.step6.taskSelections = {};
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  }
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      writing_tendency: S.director.step5.form.writing_tendency || '',
+      dialogue_density: S.director.step5.form.dialogue_density || '',
+      rating_intensity: S.director.step5.form.rating_intensity || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/draft`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step5.result = res?.draft_result || null;
+  } catch (e) {
+    S.director.step5.error = e?.message || '生成一稿失败';
+  } finally {
+    S.director.step5.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorStartReview = async function () {
+  if (!S.director?.step6 || S.director.step6.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step6.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step6.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+  if (!S.director.step5?.result) {
+    S.director.step6.error = '请先生成“剧本一稿”';
+    render();
+    return;
+  }
+
+  S.director.step6.generating = true;
+  S.director.step6.error = '';
+  if (S.director.step7) {
+    S.director.step7.error = '';
+    S.director.step7.result = null;
+
+    resetDirectorStep8Result();
+  }
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      review_dimensions: Array.isArray(S.director.step6.form.review_dimensions)
+        ? S.director.step6.form.review_dimensions
+        : [],
+      rewrite_preference: S.director.step6.form.rewrite_preference || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/review`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step6.result = res?.review_result || null;
+    const taskSheet = Array.isArray(S.director.step6.result?.task_sheet) ? S.director.step6.result.task_sheet : [];
+    S.director.step6.taskSelections = Object.fromEntries(
+      taskSheet
+        .filter((task) => task && typeof task.task_id === 'string')
+        .map((task) => [task.task_id, String(task.default_action || 'accept')]),
+    );
+    if (S.director.step7) {
+      S.director.step7.error = '';
+      S.director.step7.result = null;
+
+      resetDirectorStep8Result();
+    }
+  } catch (e) {
+    S.director.step6.error = e?.message || '评审失败';
+  } finally {
+    S.director.step6.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateRewrite = async function () {
+  if (!S.director?.step7 || S.director.step7.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step7.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!Number.isInteger(S.director.step1?.selected_logline_index) || !Number.isInteger(S.director.step1?.selected_mode_index)) {
+    S.director.step7.error = '请先在“初始种子”中选定 Logline 和创作模式';
+    render();
+    return;
+  }
+  if (!S.director.step6?.result) {
+    S.director.step7.error = '请先完成“评审质检”并生成评审结果';
+    render();
+    return;
+  }
+
+  const taskSheet = Array.isArray(S.director.step6.result?.task_sheet) ? S.director.step6.result.task_sheet : [];
+  const taskSelections = S.director.step6.taskSelections || {};
+  const acceptedTasks = taskSheet
+    .map((task) => ({
+      task_id: task?.task_id,
+      action: String(taskSelections[task?.task_id] || task?.default_action || ''),
+    }))
+    .filter((task) => typeof task.task_id === 'string' && ['accept', 'alternative'].includes(task.action));
+
+  S.director.step7.generating = true;
+  S.director.step7.error = '';
+  resetDirectorStep8Result();
+  render();
+  try {
+    const payload = {
+      selected_logline_index: S.director.step1.selected_logline_index,
+      selected_mode_index: S.director.step1.selected_mode_index,
+      accepted_tasks: acceptedTasks,
+      rewrite_scope: S.director.step7.form.rewrite_scope || '',
+      strengthen_metrics: S.director.step7.form.strengthen_metrics || '',
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/rewrite`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step7.result = res?.rewrite_result || null;
+  } catch (e) {
+    S.director.step7.error = e?.message || '生成新版本失败';
+  } finally {
+    S.director.step7.generating = false;
+    render();
+  }
+};
+
+window.handleDirectorGenerateDeliverables = async function () {
+  if (!S.director?.step8 || S.director.step8.generating) return;
+  if (!S.director?.project?.project_id) {
+    S.director.step8.error = '请先在“项目初始化”创建项目';
+    render();
+    return;
+  }
+  if (!S.director.step7?.result) {
+    S.director.step8.error = '请先完成“迭代改稿”并生成新版本';
+    render();
+    return;
+  }
+
+  S.director.step8.generating = true;
+  S.director.step8.error = '';
+  render();
+  try {
+    const payload = {
+      selected_version: S.director.step8.form.selected_version || '',
+      asset_filter: S.director.step8.form.asset_filter || '',
+      export_format: S.director.step8.form.export_format || '',
+      export_items: Array.isArray(S.director.step8.form.export_items) ? S.director.step8.form.export_items : [],
+    };
+    const res = await apiFetch(`/api/director/projects/${encodeURIComponent(S.director.project.project_id)}/deliverables`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    S.director.step8.result = res?.deliverables_result || null;
+  } catch (e) {
+    S.director.step8.error = e?.message || '生成导出包预览失败';
+  } finally {
+    S.director.step8.generating = false;
+    render();
+  }
 };
 
 // ============ Render ============
@@ -363,6 +1121,10 @@ function showStudioHoverPreview(panelId, anchorRect) {
 //  AGENT PAGE (unified container with left sidebar)
 // ======================================================================
 function renderAgent() {
+  if (S.agentModule === 'director') {
+    return renderDirectorAgentView(S.director);
+  }
+
   const tabs = [
     {
       id: 'split',
@@ -401,7 +1163,7 @@ function renderAgent() {
           <rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/>
           <rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>
         </svg>
-        <span>漫画分镜智能体</span>
+        <span>${STORYBOARD_AGENT_TITLE}</span>
       </div>
       <nav class="agent-nav">
         ${tabs.map(t => `
@@ -1421,6 +2183,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadWorkbenchUiState();
   if (S.view === 'settings') {
     navigate('settings');
+    return;
+  }
+  if (S.agentModule === 'director') {
+    navigate('director');
     return;
   }
   if (S.agentTab === 'studio' && S.studioRunId) {

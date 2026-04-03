@@ -8,13 +8,6 @@ Usage:
 """
 from __future__ import annotations
 
-# Load .env file before anything else
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
 import argparse
 import csv
 import io
@@ -35,6 +28,20 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from app.shared.config import (
+    frontend_dir,
+    load_runtime_dotenv,
+    output_dir,
+    project_root,
+    runtime_data_root,
+    storyboard_config_path,
+    ui_state_dir,
+    upload_dir,
+    workbench_ui_dir,
+    workbench_ui_state_path,
+)
+from app.agents.director.router import router as director_router
+from app.agents.storyboard.router import register_storyboard_routes
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -42,10 +49,13 @@ from fastapi.staticfiles import StaticFiles
 
 import uvicorn
 
+load_runtime_dotenv()
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 app = FastAPI(title="Picslit2 Pipeline Workbench", version="1.0.0")
+app.include_router(director_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -53,13 +63,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-OUTPUT_DIR = ROOT / "output"
-UI_STATE_DIR = OUTPUT_DIR / "_ui_state"
-WORKBENCH_UI_DIR = UI_STATE_DIR / "_workbench"
-WORKBENCH_UI_STATE_PATH = WORKBENCH_UI_DIR / "ui_state.json"
-UPLOAD_DIR = OUTPUT_DIR / "_uploads"
-FRONTEND_DIR = ROOT / "frontend"
-CONFIG_PATH = ROOT / "config" / "storyboard.toml"
+RESOURCE_ROOT = project_root()
+DATA_ROOT = runtime_data_root()
+OUTPUT_DIR = output_dir()
+UI_STATE_DIR = ui_state_dir()
+WORKBENCH_UI_DIR = workbench_ui_dir()
+WORKBENCH_UI_STATE_PATH = workbench_ui_state_path()
+UPLOAD_DIR = upload_dir()
+FRONTEND_DIR = frontend_dir()
+CONFIG_PATH = storyboard_config_path()
 
 # In-memory run registry  { runId: { ... } }
 _runs: Dict[str, Dict[str, Any]] = {}
@@ -944,10 +956,14 @@ def serve_file(path: str = Query(...)):
     """Serve a file from the output directory."""
     p = Path(path).expanduser().resolve()
 
-    # Security: only serve files under project dir
+    # Security: only serve files under the packaged resources or runtime data dirs.
     try:
-        p.relative_to(ROOT.resolve())
-    except ValueError:
+        allowed_roots = [RESOURCE_ROOT.resolve(), DATA_ROOT.resolve()]
+        if not any(p.is_relative_to(root) for root in allowed_roots):
+            raise HTTPException(403, "Access denied")
+    except HTTPException:
+        raise
+    except Exception:
         raise HTTPException(403, "Access denied")
 
     if not p.exists():
@@ -1251,12 +1267,18 @@ async def bind_panel_texts(request: dict = None):
     return {"status": "ok", "binding": binding_payload, "cleared": clear_binding}
 
 
+# Register storyboard route shell after local routes are declared.
+register_storyboard_routes(app)
+
+
 # ---------------------------------------------------------------------------
 # Static file serving (frontend)
 # ---------------------------------------------------------------------------
 @app.on_event("startup")
 def on_startup():
     _init_runs_from_disk()
+    print(f"[workbench] resource_root={RESOURCE_ROOT}")
+    print(f"[workbench] data_root={DATA_ROOT}")
     print(f"[workbench] output_dir={OUTPUT_DIR}")
     print(f"[workbench] ui_state_dir={UI_STATE_DIR}")
     print(f"[workbench] frontend_dir={FRONTEND_DIR}")

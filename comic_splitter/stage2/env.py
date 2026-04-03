@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from dataclasses import dataclass
+
+from app.shared.config import load_runtime_dotenv
 
 
 @dataclass
@@ -14,13 +15,7 @@ class VolcEnv:
 
 
 def load_volc_env() -> VolcEnv:
-    # Auto-load .env if present.
-    try:
-        from dotenv import load_dotenv
-
-        load_dotenv(dotenv_path=Path.cwd() / ".env", override=False)
-    except Exception:
-        pass
+    load_runtime_dotenv()
     base_url = os.getenv("VOLC_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3").strip()
     # Accept users pasting the full endpoint path from curl examples.
     if base_url.endswith("/embeddings/multimodal"):

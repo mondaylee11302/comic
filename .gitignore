@@ -11,6 +11,8 @@ __pycache__/
 # Generated artifacts
 output/
 .cache/
+build/
+dist/
 
 # UV/Python local env
 .venv/

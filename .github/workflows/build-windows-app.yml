@@ -1,0 +1,35 @@
+name: Build Windows App
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller pywebview
+          pip install fastapi uvicorn python-dotenv numpy opencv-python psd-tools python-multipart requests scikit-image "volcengine-python-sdk[ark]"
+
+      - name: Build desktop app
+        shell: pwsh
+        run: |
+          python scripts/build_windows_app.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Picslit2-windows-app
+          path: dist/Picslit2

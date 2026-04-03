@@ -14,6 +14,8 @@ import numpy as np
 from psd_tools import PSDImage
 from psd_tools.api.layers import Layer
 
+from app.shared.config import load_runtime_dotenv
+
 try:
     from PIL import Image
 except Exception:  # pragma: no cover - pillow is expected via psd-tools
@@ -100,13 +102,7 @@ class OcrExtractResult:
 
 
 def _load_dotenv_from_repo_root() -> None:
-    try:
-        from dotenv import load_dotenv
-
-        root = Path(__file__).resolve().parents[1]
-        load_dotenv(dotenv_path=root / ".env", override=False)
-    except Exception:
-        return
+    load_runtime_dotenv()
 
 
 def _resolve_env_float(name: str, default: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
