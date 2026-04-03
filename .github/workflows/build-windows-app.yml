@@ -3,6 +3,14 @@ name: Build Windows App
 on:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: desktop-latest
+  RELEASE_TITLE: Latest Windows Build
+  RELEASE_ASSET: Picslit2-windows-app.zip
+
 jobs:
   build:
     runs-on: windows-latest
@@ -28,8 +36,39 @@ jobs:
         run: |
           python scripts/build_windows_app.py
 
+      - name: Package release zip
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/${env:RELEASE_ASSET}") {
+            Remove-Item "dist/${env:RELEASE_ASSET}" -Force
+          }
+          Compress-Archive -Path "dist/Picslit2/*" -DestinationPath "dist/${env:RELEASE_ASSET}"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: Picslit2-windows-app
-          path: dist/Picslit2
+          path: dist/${{ env.RELEASE_ASSET }}
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --tags --force
+          git tag -f $env:RELEASE_TAG $env:GITHUB_SHA
+          git push origin "refs/tags/$env:RELEASE_TAG" --force
+
+          $releaseNotes = @"
+          自动构建的 Windows 桌面版。
+
+          下载后请先解压整个压缩包，再双击其中的 Picslit2.exe。
+          首次启动时只需要填写 API Key，其他参数已内置为预设值。
+          "@
+
+          if (gh release view $env:RELEASE_TAG 2>$null) {
+            gh release edit $env:RELEASE_TAG --title $env:RELEASE_TITLE --notes $releaseNotes
+            gh release upload $env:RELEASE_TAG "dist/$env:RELEASE_ASSET" --clobber
+          } else {
+            gh release create $env:RELEASE_TAG "dist/$env:RELEASE_ASSET" --title $env:RELEASE_TITLE --notes $releaseNotes
+          }

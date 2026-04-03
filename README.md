@@ -2,6 +2,11 @@
 
 Picslit2 是一个漫画分镜/文本处理工作台项目，后端基于 FastAPI，前端位于 `frontend/`。
 
+## 下载
+
+- Windows 桌面版下载：`https://github.com/mondaylee11302/comic/releases/download/desktop-latest/Picslit2-windows-app.zip`
+- Releases 页面：`https://github.com/mondaylee11302/comic/releases`
+
 ## 目录说明
 
 - `app/`: 后端业务模块
